@@ -88,8 +88,8 @@ jobs:
           fi
 
           mkdir -p metrics
-          # Only sync benchmark artifacts under metrics/. Keep any user-managed files outside metrics/.
-          rsync -a --delete "$GITHUB_WORKSPACE/metrics/" metrics/
+          # Merge new benchmark artifacts into metrics/ without deleting historical files.
+          cp -r "$GITHUB_WORKSPACE/metrics/." metrics/ || true
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
