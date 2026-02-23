@@ -1,7 +1,7 @@
 use crate::config::AuthConfig;
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
-    Aes128Gcm, Nonce,
+    aead::{AeadInPlace, KeyInit, OsRng, rand_core::RngCore},
+    Aes128Gcm, Nonce, Tag,
 };
 use anyhow::{anyhow, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -9,7 +9,10 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -48,6 +51,8 @@ pub struct AuthManager {
     pub heartbeat_interval: Duration,
     pub auth_timeout: Duration,
     pub data_timeout: Duration,
+    nonce_prefix: [u8; 4],
+    nonce_counter: Arc<AtomicU64>,
     challenge_cache: Arc<Mutex<HashMap<[u8; CHALLENGE_SIZE], Instant>>>,
     delay_window: Arc<Mutex<Vec<Duration>>>,
     delay_index: Arc<AtomicUsize>,
@@ -77,6 +82,8 @@ impl AuthManager {
         };
 
         let delay_window_size = cfg.delay_window_size.max(1);
+        let mut nonce_prefix = [0u8; 4];
+        OsRng.fill_bytes(&mut nonce_prefix);
 
         Ok(Some(Self {
             secret: Arc::new(digest),
@@ -85,6 +92,8 @@ impl AuthManager {
             heartbeat_interval: Duration::from_secs(cfg.heartbeat_interval.max(1)),
             auth_timeout: Duration::from_secs(cfg.auth_timeout.max(1)),
             data_timeout: Duration::from_secs(65),
+            nonce_prefix,
+            nonce_counter: Arc::new(AtomicU64::new(0)),
             challenge_cache: Arc::new(Mutex::new(HashMap::new())),
             delay_window: Arc::new(Mutex::new(vec![Duration::ZERO; delay_window_size])),
             delay_index: Arc::new(AtomicUsize::new(0)),
@@ -180,22 +189,29 @@ impl AuthManager {
             };
 
             let mut nonce_bytes = [0u8; NONCE_SIZE];
-            OsRng.fill_bytes(&mut nonce_bytes);
+            nonce_bytes[..4].copy_from_slice(&self.nonce_prefix);
+            let ctr = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+            nonce_bytes[4..].copy_from_slice(&ctr.to_be_bytes());
 
             let ts = now_millis();
-            let mut plaintext = BytesMut::with_capacity(TIMESTAMP_SIZE + CONN_ID_SIZE + payload.len());
-            plaintext.extend_from_slice(&ts.to_be_bytes());
-            plaintext.extend_from_slice(&conn_id.to_be_bytes());
-            plaintext.extend_from_slice(payload);
+            let mut ciphertext = Vec::with_capacity(TIMESTAMP_SIZE + CONN_ID_SIZE + payload.len());
+            ciphertext.extend_from_slice(&ts.to_be_bytes());
+            ciphertext.extend_from_slice(&conn_id.to_be_bytes());
+            ciphertext.extend_from_slice(payload);
 
-            let ciphertext = cipher
-                .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
+            let tag = cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), b"", &mut ciphertext)
                 .map_err(|_| anyhow!("encrypt failed"))?;
 
-            let mut out = BytesMut::with_capacity(HEADER_SIZE + NONCE_SIZE + ciphertext.len());
-            write_header(&mut out, MSG_TYPE_DATA, (NONCE_SIZE + ciphertext.len()) as u32);
+            let mut out = BytesMut::with_capacity(HEADER_SIZE + NONCE_SIZE + ciphertext.len() + tag.len());
+            write_header(
+                &mut out,
+                MSG_TYPE_DATA,
+                (NONCE_SIZE + ciphertext.len() + tag.len()) as u32,
+            );
             out.extend_from_slice(&nonce_bytes);
             out.extend_from_slice(&ciphertext);
+            out.extend_from_slice(tag.as_slice());
             Ok(out.freeze())
         } else {
             let mut out = BytesMut::with_capacity(HEADER_SIZE + CONN_ID_SIZE + payload.len());
@@ -226,13 +242,20 @@ impl AuthManager {
             let Some(cipher) = &self.cipher else {
                 return Err(anyhow!("cipher unavailable"));
             };
-            if body.len() < NONCE_SIZE {
+            if body.len() < NONCE_SIZE + 16 {
                 return Err(anyhow!("encrypted frame too short"));
             }
 
             let nonce = Nonce::from_slice(&body[..NONCE_SIZE]);
-            let plaintext = cipher
-                .decrypt(nonce, &body[NONCE_SIZE..])
+            let encrypted = &body[NONCE_SIZE..];
+            let split = encrypted
+                .len()
+                .checked_sub(16)
+                .ok_or_else(|| anyhow!("encrypted frame too short"))?;
+            let mut plaintext = encrypted[..split].to_vec();
+            let tag = Tag::from_slice(&encrypted[split..]);
+            cipher
+                .decrypt_in_place_detached(nonce, b"", &mut plaintext, tag)
                 .map_err(|_| anyhow!("decrypt failed"))?;
 
             if plaintext.len() < TIMESTAMP_SIZE + CONN_ID_SIZE {
@@ -246,7 +269,8 @@ impl AuthManager {
             }
 
             let conn_id = u64::from_be_bytes(plaintext[TIMESTAMP_SIZE..TIMESTAMP_SIZE + CONN_ID_SIZE].try_into().unwrap());
-            let payload = Bytes::copy_from_slice(&plaintext[TIMESTAMP_SIZE + CONN_ID_SIZE..]);
+            let plaintext = Bytes::from(plaintext);
+            let payload = plaintext.slice(TIMESTAMP_SIZE + CONN_ID_SIZE..);
             Ok(UnwrappedFrame::Data { conn_id, payload })
         } else {
             if body.len() < CONN_ID_SIZE {

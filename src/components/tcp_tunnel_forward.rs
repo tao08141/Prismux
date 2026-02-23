@@ -44,7 +44,8 @@ struct TunnelTarget {
 
 pub struct TcpTunnelForwardComponent {
     tag: String,
-    detour: Vec<String>,
+    tag_arc: Arc<str>,
+    detour: Arc<[String]>,
     auth: AuthManager,
     targets: Vec<Arc<TunnelTarget>>,
     forward_id: [u8; 8],
@@ -76,10 +77,13 @@ impl TcpTunnelForwardComponent {
         if targets.is_empty() {
             return Err(anyhow!("tcp_tunnel_forward requires at least one forwarder"));
         }
+        let tag = cfg.tag;
+        let tag_arc = Arc::<str>::from(tag.as_str());
 
         Ok(Arc::new(Self {
-            tag: cfg.tag,
-            detour: cfg.detour,
+            tag,
+            tag_arc,
+            detour: Arc::<[String]>::from(cfg.detour),
             auth,
             targets,
             forward_id,
@@ -120,7 +124,7 @@ impl TcpTunnelForwardComponent {
         stream.set_nodelay(true)?;
         let (mut reader, mut writer) = stream.into_split();
 
-        let (tx, mut rx) = mpsc::channel::<Bytes>(4096);
+        let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
         let mut pool_id = [0u8; 8];
         rand::thread_rng().fill(&mut pool_id);
 
@@ -167,12 +171,14 @@ impl TcpTunnelForwardComponent {
                         }
                         let packet = Packet {
                             data: payload,
-                            src_tag: Arc::from(this.tag.as_str()),
+                            src_tag: Arc::clone(&this.tag_arc),
                             src_addr: None,
                             conn_id,
                             proto: None,
                         };
-                        let _ = router.route(packet, &this.detour);
+                        let _ = router
+                            .route_shared(packet, Arc::clone(&this.detour))
+                            .await;
                     }
                     Ok(UnwrappedFrame::Control { header, payload }) => {
                         match header.msg_type {
@@ -205,24 +211,41 @@ impl TcpTunnelForwardComponent {
     }
 
     fn pick_conn(&self, target: &TunnelTarget) -> Option<Arc<TunnelForwardConn>> {
-        let conns: Vec<(u64, Arc<TunnelForwardConn>)> = target
-            .conns
-            .iter()
-            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
-            .collect();
-
-        if conns.is_empty() {
+        let len = target.conns.len();
+        if len == 0 {
             return None;
         }
+        let start = (target.rr.fetch_add(1, Ordering::Relaxed) as usize) % len;
 
-        for _ in 0..conns.len() {
-            let idx = (target.rr.fetch_add(1, Ordering::Relaxed) as usize) % conns.len();
-            let (_, conn) = &conns[idx];
-            if conn.authenticated.load(Ordering::Relaxed) {
-                return Some(Arc::clone(conn));
+        let mut idx = 0usize;
+        for entry in target.conns.iter() {
+            if idx >= start && entry.authenticated.load(Ordering::Relaxed) {
+                return Some(Arc::clone(entry.value()));
             }
+            idx = idx.saturating_add(1);
+        }
+
+        idx = 0;
+        for entry in target.conns.iter() {
+            if idx >= start {
+                break;
+            }
+            if entry.authenticated.load(Ordering::Relaxed) {
+                return Some(Arc::clone(entry.value()));
+            }
+            idx = idx.saturating_add(1);
         }
         None
+    }
+
+    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes) {
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let _ = tx.send(frame).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -244,7 +267,7 @@ impl Component for TcpTunnelForwardComponent {
 
         for target in &self.targets {
             if let Some(conn) = self.pick_conn(target) {
-                let _ = conn.tx.try_send(frame.clone());
+                Self::send_frame(&conn.tx, frame.clone()).await;
             }
         }
 

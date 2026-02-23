@@ -17,13 +17,13 @@ enum RuleMatch {
 
 struct IpRule {
     matcher: RuleMatch,
-    targets: Vec<String>,
+    targets: Arc<[String]>,
 }
 
 pub struct IPRouterComponent {
     tag: String,
     rules: Vec<IpRule>,
-    detour_miss: Vec<String>,
+    detour_miss: Arc<[String]>,
 }
 
 impl IPRouterComponent {
@@ -42,14 +42,14 @@ impl IPRouterComponent {
             };
             rules.push(IpRule {
                 matcher,
-                targets: rule.targets,
+                targets: Arc::<[String]>::from(rule.targets),
             });
         }
 
         Ok(Arc::new(Self {
             tag: cfg.tag,
             rules,
-            detour_miss: cfg.detour_miss,
+            detour_miss: Arc::<[String]>::from(cfg.detour_miss),
         }))
     }
 }
@@ -68,7 +68,9 @@ impl Component for IPRouterComponent {
         let src_ip = packet.src_addr.map(|a| a.ip());
         if src_ip.is_none() {
             if !self.detour_miss.is_empty() {
-                router.route(packet, &self.detour_miss)?;
+                router
+                    .route_shared(packet, Arc::clone(&self.detour_miss))
+                    .await?;
             }
             return Ok(());
         }
@@ -77,11 +79,15 @@ impl Component for IPRouterComponent {
         for rule in &self.rules {
             match &rule.matcher {
                 RuleMatch::Ip(ip) if *ip == src_ip => {
-                    router.route(packet, &rule.targets)?;
+                    router
+                        .route_shared(packet, Arc::clone(&rule.targets))
+                        .await?;
                     return Ok(());
                 }
                 RuleMatch::Cidr(cidr) if cidr.contains(&src_ip) => {
-                    router.route(packet, &rule.targets)?;
+                    router
+                        .route_shared(packet, Arc::clone(&rule.targets))
+                        .await?;
                     return Ok(());
                 }
                 RuleMatch::Geo(_) => {
@@ -92,7 +98,9 @@ impl Component for IPRouterComponent {
         }
 
         if !self.detour_miss.is_empty() {
-            router.route(packet, &self.detour_miss)?;
+            router
+                .route_shared(packet, Arc::clone(&self.detour_miss))
+                .await?;
         }
 
         Ok(())

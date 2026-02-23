@@ -13,14 +13,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
+use socket2::SockRef;
 use std::{
-    net::SocketAddr,
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    net::{SocketAddr, UdpSocket as StdUdpSocket},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     net::UdpSocket,
-    sync::RwLock,
+    sync::RwLock as TokioRwLock,
     time::{self, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
@@ -34,15 +38,19 @@ struct ListenConn {
 
 pub struct ListenComponent {
     tag: String,
+    tag_arc: Arc<str>,
     listen_addr: String,
     timeout: Duration,
     replace_old_mapping: bool,
-    detour: Vec<String>,
+    detour: Arc<[String]>,
     broadcast_mode: bool,
     send_timeout: Duration,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
     auth: Option<AuthManager>,
-    socket: RwLock<Option<Arc<UdpSocket>>>,
+    socket: TokioRwLock<Option<Arc<UdpSocket>>>,
     mappings: DashMap<SocketAddr, ListenConn>,
+    broadcast_targets: RwLock<Arc<[SocketAddr]>>,
     running: AtomicBool,
 }
 
@@ -50,19 +58,27 @@ impl ListenComponent {
     pub fn new(cfg: ComponentConfig) -> Result<Arc<Self>> {
         let timeout = Duration::from_secs(cfg.timeout.max(1));
         let send_timeout = Duration::from_millis(cfg.send_timeout.max(1));
+        let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
+        let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
         let auth = AuthManager::from_config(cfg.auth.as_ref())?;
+        let tag = cfg.tag;
+        let tag_arc = Arc::<str>::from(tag.as_str());
 
         Ok(Arc::new(Self {
-            tag: cfg.tag,
+            tag,
+            tag_arc,
             listen_addr: cfg.listen_addr,
             timeout,
             replace_old_mapping: cfg.replace_old_mapping,
-            detour: cfg.detour,
+            detour: Arc::<[String]>::from(cfg.detour),
             broadcast_mode: cfg.broadcast_mode.unwrap_or(true),
             send_timeout,
+            recv_buffer_size,
+            send_buffer_size,
             auth,
-            socket: RwLock::new(None),
+            socket: TokioRwLock::new(None),
             mappings: DashMap::new(),
+            broadcast_targets: RwLock::new(Arc::from(Vec::<SocketAddr>::new().into_boxed_slice())),
             running: AtomicBool::new(false),
         }))
     }
@@ -95,7 +111,11 @@ impl ListenComponent {
         while self.running.load(Ordering::Relaxed) {
             ticker.tick().await;
             let timeout = self.timeout;
+            let before = self.mappings.len();
             self.mappings.retain(|_, conn| conn.last_active.elapsed() <= timeout);
+            if self.mappings.len() != before {
+                self.refresh_broadcast_targets();
+            }
         }
     }
 
@@ -131,7 +151,10 @@ impl ListenComponent {
                                 .await?;
                             socket.send_to(&resp, addr).await?;
 
-                            self.upsert_mapping(addr, true, 0);
+                            let (_, changed) = self.upsert_mapping(addr, true, 0);
+                            if changed {
+                                self.refresh_broadcast_targets();
+                            }
                             return Ok(());
                         }
                         MSG_TYPE_HEARTBEAT => {
@@ -152,7 +175,9 @@ impl ListenComponent {
                             return Ok(());
                         }
                         MSG_TYPE_DISCONNECT => {
-                            self.mappings.remove(&addr);
+                            if self.mappings.remove(&addr).is_some() {
+                                self.refresh_broadcast_targets();
+                            }
                             return Ok(());
                         }
                         MSG_TYPE_DATA => unreachable!(),
@@ -162,31 +187,39 @@ impl ListenComponent {
                 Err(err) => return Err(err),
             }
         } else {
-            let conn_id = self.upsert_mapping(addr, false, 0);
+            let (conn_id, changed) = self.upsert_mapping(addr, false, 0);
+            if changed {
+                self.refresh_broadcast_targets();
+            }
             (Bytes::copy_from_slice(datagram), conn_id)
         };
 
         let packet = Packet {
             data: payload,
-            src_tag: Arc::from(self.tag.as_str()),
+            src_tag: Arc::clone(&self.tag_arc),
             src_addr: Some(addr),
             conn_id,
             proto: None,
         };
 
-        router.route(packet, &self.detour)
+        router
+            .route_shared(packet, Arc::clone(&self.detour))
+            .await
     }
 
-    fn upsert_mapping(&self, addr: SocketAddr, authenticated: bool, conn_override: u64) -> u64 {
+    fn upsert_mapping(&self, addr: SocketAddr, authenticated: bool, conn_override: u64) -> (u64, bool) {
         if let Some(mut existing) = self.mappings.get_mut(&addr) {
+            let mut changed = false;
             existing.last_active = Instant::now();
-            if authenticated {
+            if authenticated && !existing.authenticated {
                 existing.authenticated = true;
+                changed = true;
             }
-            if conn_override != 0 {
+            if conn_override != 0 && existing.conn_id != conn_override {
                 existing.conn_id = conn_override;
+                changed = true;
             }
-            return existing.conn_id;
+            return (existing.conn_id, changed);
         }
 
         if self.replace_old_mapping {
@@ -202,7 +235,7 @@ impl ListenComponent {
                 })
                 .collect();
             for old in same_ip {
-                self.mappings.remove(&old);
+                let _ = self.mappings.remove(&old);
             }
         }
 
@@ -221,7 +254,20 @@ impl ListenComponent {
                 last_heartbeat_sent: None,
             },
         );
-        conn_id
+        (conn_id, true)
+    }
+
+    fn refresh_broadcast_targets(&self) {
+        let mut targets = Vec::with_capacity(self.mappings.len());
+        for conn in self.mappings.iter() {
+            if self.auth.is_some() && !conn.authenticated {
+                continue;
+            }
+            targets.push(*conn.key());
+        }
+        if let Ok(mut lock) = self.broadcast_targets.write() {
+            *lock = Arc::from(targets.into_boxed_slice());
+        }
     }
 
     async fn socket(&self) -> Result<Arc<UdpSocket>> {
@@ -237,7 +283,13 @@ impl Component for ListenComponent {
     }
 
     async fn start(self: Arc<Self>, router: Arc<Router>) -> Result<()> {
-        let socket = Arc::new(UdpSocket::bind(&self.listen_addr).await?);
+        let std_socket = StdUdpSocket::bind(&self.listen_addr)?;
+        std_socket.set_nonblocking(true)?;
+        let sock_ref = SockRef::from(&std_socket);
+        let _ = sock_ref.set_recv_buffer_size(self.recv_buffer_size);
+        let _ = sock_ref.set_send_buffer_size(self.send_buffer_size);
+
+        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
         socket.set_broadcast(true)?;
         {
             let mut lock = self.socket.write().await;
@@ -264,11 +316,14 @@ impl Component for ListenComponent {
 
         if self.broadcast_mode {
             let mut sent = 0usize;
-            for conn in self.mappings.iter() {
-                if self.auth.is_some() && !conn.authenticated {
-                    continue;
-                }
-                match socket.send_to(&payload, *conn.key()).await {
+            let targets = self
+                .broadcast_targets
+                .read()
+                .ok()
+                .map(|g| Arc::clone(&*g))
+                .unwrap_or_else(|| Arc::from(Vec::<SocketAddr>::new().into_boxed_slice()));
+            for addr in targets.iter() {
+                match socket.send_to(&payload, *addr).await {
                     Ok(_) => sent += 1,
                     Err(err) => warn!("{} send error: {err}", self.tag),
                 }

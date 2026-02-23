@@ -37,8 +37,9 @@ struct TunnelListenConn {
 
 pub struct TcpTunnelListenComponent {
     tag: String,
+    tag_arc: Arc<str>,
     listen_addr: String,
-    detour: Vec<String>,
+    detour: Arc<[String]>,
     auth: AuthManager,
     send_timeout: Duration,
     broadcast_mode: bool,
@@ -51,11 +52,14 @@ impl TcpTunnelListenComponent {
     pub fn new(cfg: ComponentConfig) -> Result<Arc<Self>> {
         let auth = AuthManager::from_config(cfg.auth.as_ref())?
             .ok_or_else(|| anyhow!("tcp_tunnel_listen requires auth.enabled=true"))?;
+        let tag = cfg.tag;
+        let tag_arc = Arc::<str>::from(tag.as_str());
 
         Ok(Arc::new(Self {
-            tag: cfg.tag,
+            tag,
+            tag_arc,
             listen_addr: cfg.listen_addr,
-            detour: cfg.detour,
+            detour: Arc::<[String]>::from(cfg.detour),
             auth,
             send_timeout: Duration::from_millis(cfg.send_timeout.max(1)),
             broadcast_mode: cfg.broadcast_mode.unwrap_or(true),
@@ -79,7 +83,7 @@ impl TcpTunnelListenComponent {
 
     async fn handle_stream(self: Arc<Self>, router: Arc<Router>, id: u64, stream: TcpStream) {
         let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::channel::<Bytes>(4096);
+        let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
 
         let conn = Arc::new(TunnelListenConn {
             tx,
@@ -114,12 +118,14 @@ impl TcpTunnelListenComponent {
                     *conn.last_active.write().await = Instant::now();
                     let packet = Packet {
                         data: payload,
-                        src_tag: Arc::from(self.tag.as_str()),
+                        src_tag: Arc::clone(&self.tag_arc),
                         src_addr: None,
                         conn_id,
                         proto: None,
                     };
-                    let _ = router.route(packet, &self.detour);
+                    let _ = router
+                        .route_shared(packet, Arc::clone(&self.detour))
+                        .await;
                 }
                 Ok(UnwrappedFrame::Control { header, payload }) => {
                     match header.msg_type {
@@ -162,6 +168,16 @@ impl TcpTunnelListenComponent {
         self.conns.remove(&id);
         write_task.abort();
     }
+
+    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes) {
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                let _ = tx.send(frame).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
 }
 
 #[async_trait]
@@ -186,7 +202,7 @@ impl Component for TcpTunnelListenComponent {
                 if !conn.authenticated.load(Ordering::Relaxed) {
                     continue;
                 }
-                let _ = conn.tx.try_send(frame.clone());
+                Self::send_frame(&conn.tx, frame.clone()).await;
             }
         } else {
             let target = self
@@ -196,7 +212,7 @@ impl Component for TcpTunnelListenComponent {
                 .map(|e| e.key().to_owned());
             if let Some(id) = target {
                 if let Some(conn) = self.conns.get(&id) {
-                    let _ = conn.tx.try_send(frame);
+                    Self::send_frame(&conn.tx, frame).await;
                 }
             }
         }

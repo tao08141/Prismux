@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
+use socket2::SockRef;
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, UdpSocket as StdUdpSocket},
     sync::{atomic::{AtomicBool, Ordering}, Arc},
     time::{Duration, Instant},
 };
@@ -34,12 +35,15 @@ struct ForwardPeer {
 
 pub struct ForwardComponent {
     tag: String,
-    detour: Vec<String>,
+    tag_arc: Arc<str>,
+    detour: Arc<[String]>,
     forwarders: Vec<String>,
     reconnect_interval: Duration,
     check_interval: Duration,
     send_keepalive: bool,
     send_timeout: Duration,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
     auth: Option<AuthManager>,
     peers: DashMap<String, Arc<ForwardPeer>>,
     running: AtomicBool,
@@ -52,19 +56,26 @@ impl ForwardComponent {
         let reconnect_interval = Duration::from_secs(cfg.reconnect_interval.max(1));
         let check_interval = Duration::from_secs(cfg.connection_check_time.max(1));
         let send_timeout = Duration::from_millis(cfg.send_timeout.max(1));
+        let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
+        let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
         let send_keepalive = cfg.send_keepalive.unwrap_or(true);
+        let tag = cfg.tag;
+        let tag_arc = Arc::<str>::from(tag.as_str());
 
         let mut forward_id = [0u8; 8];
         rand::thread_rng().fill(&mut forward_id);
 
         Ok(Arc::new(Self {
-            tag: cfg.tag,
-            detour: cfg.detour,
+            tag,
+            tag_arc,
+            detour: Arc::<[String]>::from(cfg.detour),
             forwarders: cfg.forwarders,
             reconnect_interval,
             check_interval,
             send_keepalive,
             send_timeout,
+            recv_buffer_size,
+            send_buffer_size,
             auth,
             peers: DashMap::new(),
             running: AtomicBool::new(false),
@@ -72,9 +83,14 @@ impl ForwardComponent {
         }))
     }
 
-    async fn create_peer(addr: SocketAddr) -> Result<Arc<ForwardPeer>> {
+    async fn create_peer(&self, addr: SocketAddr) -> Result<Arc<ForwardPeer>> {
         let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let std_socket = StdUdpSocket::bind(bind_addr)?;
+        std_socket.set_nonblocking(true)?;
+        let sock_ref = SockRef::from(&std_socket);
+        let _ = sock_ref.set_recv_buffer_size(self.recv_buffer_size);
+        let _ = sock_ref.set_send_buffer_size(self.send_buffer_size);
+        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
         socket.connect(addr).await?;
 
         Ok(Arc::new(ForwardPeer {
@@ -105,12 +121,15 @@ impl ForwardComponent {
                         }
                         let packet = Packet {
                             data: payload,
-                            src_tag: Arc::from(self.tag.as_str()),
+                            src_tag: Arc::clone(&self.tag_arc),
                             src_addr: Some(peer.addr),
                             conn_id,
                             proto: None,
                         };
-                        if let Err(err) = router.route(packet, &self.detour) {
+                        if let Err(err) = router
+                            .route_shared(packet, Arc::clone(&self.detour))
+                            .await
+                        {
                             debug!("{} route dropped: {err}", self.tag);
                         }
                     }
@@ -138,12 +157,15 @@ impl ForwardComponent {
             } else {
                 let packet = Packet {
                     data: Bytes::copy_from_slice(&buffer[..n]),
-                    src_tag: Arc::from(self.tag.as_str()),
+                    src_tag: Arc::clone(&self.tag_arc),
                     src_addr: Some(peer.addr),
                     conn_id: 0,
                     proto: None,
                 };
-                if let Err(err) = router.route(packet, &self.detour) {
+                if let Err(err) = router
+                    .route_shared(packet, Arc::clone(&self.detour))
+                    .await
+                {
                     debug!("{} route dropped: {err}", self.tag);
                 }
             }
@@ -168,7 +190,10 @@ impl ForwardComponent {
             }
 
             if let Some(auth) = &self.auth {
-                for peer in self.peers.iter() {
+                for addr in &self.forwarders {
+                    let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                        continue;
+                    };
                     if peer.authenticated.load(Ordering::Relaxed) {
                         let hb = auth.create_heartbeat(false);
                         let _ = peer.socket.send(&hb).await;
@@ -186,7 +211,10 @@ impl ForwardComponent {
                     }
                 }
             } else if self.send_keepalive {
-                for peer in self.peers.iter() {
+                for addr in &self.forwarders {
+                    let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                        continue;
+                    };
                     let _ = peer.socket.send(&[]).await;
                 }
             }
@@ -198,7 +226,7 @@ impl ForwardComponent {
             .parse()
             .map_err(|_| anyhow!("invalid forwarder addr {addr_str}"))?;
 
-        let peer = Self::create_peer(addr).await?;
+        let peer = self.create_peer(addr).await?;
 
         if let Some(auth) = &self.auth {
             let mut pool_id = [0u8; 8];
@@ -231,8 +259,11 @@ impl Component for ForwardComponent {
             }
         }
 
-        for peer in self.peers.iter() {
-            tokio::spawn(Arc::clone(&self).read_loop(Arc::clone(&router), Arc::clone(peer.value())));
+        for addr in &self.forwarders {
+            let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                continue;
+            };
+            tokio::spawn(Arc::clone(&self).read_loop(Arc::clone(&router), peer));
         }
 
         tokio::spawn(Arc::clone(&self).connection_maintenance());
@@ -248,7 +279,10 @@ impl Component for ForwardComponent {
             packet.data
         };
 
-        for peer in self.peers.iter() {
+        for addr in &self.forwarders {
+            let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                continue;
+            };
             if self.auth.is_some() && !peer.authenticated.load(Ordering::Relaxed) {
                 continue;
             }
@@ -262,9 +296,12 @@ impl Component for ForwardComponent {
     }
 
     fn is_available(&self) -> bool {
-        self.peers
-            .iter()
-            .any(|p| p.authenticated.load(Ordering::Relaxed))
+        self.forwarders.iter().any(|addr| {
+            self.peers
+                .get(addr)
+                .map(|p| p.authenticated.load(Ordering::Relaxed))
+                .unwrap_or(false)
+        })
     }
 
     async fn average_delay_ms(&self) -> f64 {

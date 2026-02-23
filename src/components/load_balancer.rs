@@ -28,15 +28,13 @@ struct TrafficSample {
 struct TrafficStats {
     samples: Vec<TrafficSample>,
     idx: usize,
-    current_bytes: u64,
-    current_packets: u64,
     total_bytes: u64,
     total_packets: u64,
 }
 
 struct CompiledRule {
     exec: RuleExec,
-    targets: Vec<String>,
+    targets: Arc<[String]>,
     available_tags: Vec<String>,
     delay_tags: Vec<String>,
 }
@@ -64,8 +62,10 @@ enum FastRule {
 pub struct LoadBalancerComponent {
     tag: String,
     rules: Vec<CompiledRule>,
-    miss: Vec<String>,
+    miss: Arc<[String]>,
     packet_seq: AtomicU64,
+    current_bytes: AtomicU64,
+    current_packets: AtomicU64,
     running: AtomicBool,
     stats: Arc<Mutex<TrafficStats>>,
     sample_interval: Duration,
@@ -83,14 +83,14 @@ impl LoadBalancerComponent {
         Ok(Arc::new(Self {
             tag: cfg.tag,
             rules,
-            miss: cfg.miss,
+            miss: Arc::<[String]>::from(cfg.miss),
             packet_seq: AtomicU64::new(0),
+            current_bytes: AtomicU64::new(0),
+            current_packets: AtomicU64::new(0),
             running: AtomicBool::new(false),
             stats: Arc::new(Mutex::new(TrafficStats {
                 samples: vec![TrafficSample::default(); window_size],
                 idx: 0,
-                current_bytes: 0,
-                current_packets: 0,
                 total_bytes: 0,
                 total_packets: 0,
             })),
@@ -108,7 +108,7 @@ impl LoadBalancerComponent {
         };
         Ok(CompiledRule {
             exec,
-            targets: rule.targets,
+            targets: Arc::<[String]>::from(rule.targets),
             available_tags,
             delay_tags,
         })
@@ -120,43 +120,52 @@ impl LoadBalancerComponent {
 
         while self.running.load(Ordering::Relaxed) {
             ticker.tick().await;
+            let current_bytes = self.current_bytes.swap(0, Ordering::Relaxed);
+            let current_packets = self.current_packets.swap(0, Ordering::Relaxed);
             let mut stats = self.stats.lock().await;
             let idx = stats.idx % stats.samples.len();
 
             stats.total_bytes = stats
                 .total_bytes
                 .saturating_sub(stats.samples[idx].bytes)
-                .saturating_add(stats.current_bytes);
+                .saturating_add(current_bytes);
             stats.total_packets = stats
                 .total_packets
                 .saturating_sub(stats.samples[idx].packets)
-                .saturating_add(stats.current_packets);
+                .saturating_add(current_packets);
 
             stats.samples[idx] = TrafficSample {
-                bytes: stats.current_bytes,
-                packets: stats.current_packets,
+                bytes: current_bytes,
+                packets: current_packets,
             };
 
-            stats.current_bytes = 0;
-            stats.current_packets = 0;
             stats.idx = (stats.idx + 1) % stats.samples.len();
         }
     }
 
     async fn current_bps_pps(&self) -> (u64, u64) {
+        let current_bytes = self.current_bytes.load(Ordering::Relaxed);
+        let current_packets = self.current_packets.load(Ordering::Relaxed);
         let stats = self.stats.lock().await;
         let sample_count = stats.samples.len() as u64 + 1;
-        let bytes = stats.total_bytes + stats.current_bytes;
-        let packets = stats.total_packets + stats.current_packets;
+        let bytes = stats.total_bytes + current_bytes;
+        let packets = stats.total_packets + current_packets;
         ((bytes * 8) / sample_count.max(1), packets / sample_count.max(1))
     }
 
-    async fn evaluate_targets(&self, router: &Router, seq: u64, size: u64, bps: u64, pps: u64) -> Vec<String> {
+    async fn evaluate_targets(
+        &self,
+        router: &Router,
+        seq: u64,
+        size: u64,
+        bps: u64,
+        pps: u64,
+    ) -> Vec<Arc<[String]>> {
         let mut selected = Vec::new();
         for rule in &self.rules {
             if let RuleExec::Fast(fast) = &rule.exec {
                 if fast_rule_matches(fast, router, seq).await {
-                    selected.extend(rule.targets.iter().cloned());
+                    selected.push(Arc::clone(&rule.targets));
                 }
                 continue;
             }
@@ -192,7 +201,7 @@ impl LoadBalancerComponent {
                     _ => false,
                 };
                 if matched {
-                    selected.extend(rule.targets.iter().cloned());
+                    selected.push(Arc::clone(&rule.targets));
                 }
             }
         }
@@ -214,23 +223,38 @@ impl Component for LoadBalancerComponent {
     }
 
     async fn handle_packet(&self, router: &Router, packet: Packet) -> Result<()> {
-        {
-            let mut stats = self.stats.lock().await;
-            stats.current_packets = stats.current_packets.saturating_add(1);
-            stats.current_bytes = stats.current_bytes.saturating_add(packet.data.len() as u64);
-        }
+        self.current_packets.fetch_add(1, Ordering::Relaxed);
+        self.current_bytes
+            .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
 
         let (bps, pps) = self.current_bps_pps().await;
         let seq = self.packet_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let size = packet.data.len() as u64;
 
-        let mut targets = self.evaluate_targets(router, seq, size, bps, pps).await;
+        let targets = self.evaluate_targets(router, seq, size, bps, pps).await;
         if targets.is_empty() {
-            targets = self.miss.clone();
+            if !self.miss.is_empty() {
+                router
+                    .route_shared(packet, Arc::clone(&self.miss))
+                    .await?;
+            }
+            return Ok(());
         }
 
-        if !targets.is_empty() {
-            router.route(packet, &targets)?;
+        if targets.len() == 1 {
+            router.route_shared(packet, Arc::clone(&targets[0])).await?;
+            return Ok(());
+        }
+
+        let total = targets.len();
+        let mut packet = Some(packet);
+        for (idx, detour) in targets.into_iter().enumerate() {
+            let routed = if idx + 1 == total {
+                packet.take().expect("packet must exist")
+            } else {
+                packet.as_ref().expect("packet must exist").clone()
+            };
+            router.route_shared(routed, detour).await?;
         }
 
         Ok(())
