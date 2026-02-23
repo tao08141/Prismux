@@ -82,15 +82,19 @@ jobs:
             git checkout -B metrics origin/metrics
           else
             git checkout --orphan metrics
+            # Ensure orphan branch starts empty and does not inherit files from default branch.
+            git rm -rf . >/dev/null 2>&1 || true
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           fi
 
           mkdir -p metrics
-          cp -r "$GITHUB_WORKSPACE/metrics/." metrics/ || true
+          # Only sync benchmark artifacts under metrics/. Keep any user-managed files outside metrics/.
+          rsync -a --delete "$GITHUB_WORKSPACE/metrics/" metrics/
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if [ -n "$(git status --porcelain)" ]; then
+          git add metrics
+          if [ -n "$(git status --porcelain -- metrics)" ]; then
             git commit -m "chore(metrics): update for ${GITHUB_SHA} (run ${GITHUB_RUN_ID})"
             git push --set-upstream origin metrics
             echo "Metrics pushed to 'metrics' branch."
@@ -101,6 +105,9 @@ jobs:
   docker-build:
     if: github.event_name == 'push'
     needs: build-and-test
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -120,8 +127,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
@@ -155,6 +162,9 @@ jobs:
   docker-manifest:
     if: github.event_name == 'push'
     needs: docker-build
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -166,8 +176,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.GHCR_TOKEN != '' && github.repository_owner || github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
         id: meta
