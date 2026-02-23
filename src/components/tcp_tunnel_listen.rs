@@ -7,13 +7,14 @@ use crate::{
     config::ComponentConfig,
     packet::Packet,
     router::Router,
-    tcp_frame::{read_frame, write_frame},
+    tcp_frame::{read_frame_into, write_frame},
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
+use socket2::SockRef;
 use std::{
     collections::HashMap,
     sync::{
@@ -46,6 +47,9 @@ pub struct TcpTunnelListenComponent {
     detour: Arc<[String]>,
     auth: AuthManager,
     send_timeout: Duration,
+    no_delay: bool,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
     broadcast_mode: bool,
     running: AtomicBool,
     conns: DashMap<u64, Arc<TunnelListenConn>>,
@@ -58,6 +62,9 @@ impl TcpTunnelListenComponent {
             .ok_or_else(|| anyhow!("tcp_tunnel_listen requires auth.enabled=true"))?;
         let tag = cfg.tag;
         let tag_arc = Arc::<str>::from(tag.as_str());
+        let no_delay = cfg.no_delay.unwrap_or(true);
+        let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
+        let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
 
         Ok(Arc::new(Self {
             tag,
@@ -70,6 +77,9 @@ impl TcpTunnelListenComponent {
             } else {
                 cfg.send_timeout
             }),
+            no_delay,
+            recv_buffer_size,
+            send_buffer_size,
             broadcast_mode: cfg.broadcast_mode.unwrap_or(true),
             running: AtomicBool::new(false),
             conns: DashMap::new(),
@@ -90,9 +100,29 @@ impl TcpTunnelListenComponent {
     }
 
     async fn handle_stream(self: Arc<Self>, router: Arc<Router>, id: u64, stream: TcpStream) {
+        let std_stream = match stream.into_std() {
+            Ok(s) => s,
+            Err(err) => {
+                debug!("{} failed to convert tcp stream: {err}", self.tag);
+                return;
+            }
+        };
+        let _ = std_stream.set_nonblocking(true);
+        let _ = std_stream.set_nodelay(self.no_delay);
+        let sock_ref = SockRef::from(&std_stream);
+        let _ = sock_ref.set_recv_buffer_size(self.recv_buffer_size);
+        let _ = sock_ref.set_send_buffer_size(self.send_buffer_size);
+        let stream = match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(err) => {
+                debug!("{} failed to restore tokio tcp stream: {err}", self.tag);
+                return;
+            }
+        };
         let (mut reader, mut writer) = stream.into_split();
         let queue_cap = router.config.queue_size.max(16384).min(131072);
         let (tx, mut rx) = mpsc::channel::<Bytes>(queue_cap);
+        let mut frame_buf = BytesMut::with_capacity(2048);
 
         let conn = Arc::new(TunnelListenConn {
             tx,
@@ -115,12 +145,11 @@ impl TcpTunnelListenComponent {
         });
 
         loop {
-            let frame = match read_frame(&mut reader).await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
+            if read_frame_into(&mut reader, &mut frame_buf).await.is_err() {
+                break;
+            }
 
-            match self.auth.unwrap_frame(&frame) {
+            match self.auth.unwrap_frame(&frame_buf) {
                 Ok(UnwrappedFrame::Data { conn_id, payload }) => {
                     if !conn.authenticated.load(Ordering::Relaxed) {
                         continue;
@@ -215,7 +244,8 @@ impl Component for TcpTunnelListenComponent {
         let frame = self.auth.wrap_data(packet.conn_id, &packet.data)?;
 
         if self.broadcast_mode {
-            let mut best_by_pool: HashMap<(u64, u64), (usize, Arc<TunnelListenConn>)> = HashMap::new();
+            let mut best_by_pool: HashMap<(u64, u64), (usize, Arc<TunnelListenConn>)> =
+                HashMap::new();
             for conn in self.conns.iter() {
                 if !conn.authenticated.load(Ordering::Relaxed) {
                     continue;

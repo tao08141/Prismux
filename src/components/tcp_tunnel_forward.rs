@@ -7,13 +7,14 @@ use crate::{
     config::ComponentConfig,
     packet::Packet,
     router::Router,
-    tcp_frame::{read_frame, write_frame},
+    tcp_frame::{read_frame_into, write_frame},
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
+use socket2::SockRef;
 use std::{
     net::SocketAddr,
     sync::{
@@ -53,6 +54,9 @@ pub struct TcpTunnelForwardComponent {
     forward_id: [u8; 8],
     check_interval: Duration,
     send_timeout: Duration,
+    no_delay: bool,
+    recv_buffer_size: usize,
+    send_buffer_size: usize,
     running: AtomicBool,
     next_conn_id: AtomicU64,
 }
@@ -86,6 +90,9 @@ impl TcpTunnelForwardComponent {
         }
         let tag = cfg.tag;
         let tag_arc = Arc::<str>::from(tag.as_str());
+        let no_delay = cfg.no_delay.unwrap_or(true);
+        let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
+        let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
 
         Ok(Arc::new(Self {
             tag,
@@ -100,6 +107,9 @@ impl TcpTunnelForwardComponent {
             } else {
                 cfg.send_timeout
             }),
+            no_delay,
+            recv_buffer_size,
+            send_buffer_size,
             running: AtomicBool::new(false),
             next_conn_id: AtomicU64::new(1),
         }))
@@ -139,7 +149,13 @@ impl TcpTunnelForwardComponent {
         router: Arc<Router>,
     ) -> Result<()> {
         let stream = TcpStream::connect(&target.addr).await?;
-        stream.set_nodelay(true)?;
+        let std_stream = stream.into_std()?;
+        std_stream.set_nonblocking(true)?;
+        std_stream.set_nodelay(self.no_delay)?;
+        let sock_ref = SockRef::from(&std_stream);
+        let _ = sock_ref.set_recv_buffer_size(self.recv_buffer_size);
+        let _ = sock_ref.set_send_buffer_size(self.send_buffer_size);
+        let stream = TcpStream::from_std(std_stream)?;
         let (mut reader, mut writer) = stream.into_split();
 
         let queue_cap = router.config.queue_size.max(16384).min(131072);
@@ -179,13 +195,13 @@ impl TcpTunnelForwardComponent {
         let this = Arc::clone(self);
         let target_for_reader = Arc::clone(&target);
         tokio::spawn(async move {
+            let mut frame_buf = BytesMut::with_capacity(2048);
             loop {
-                let frame = match read_frame(&mut reader).await {
-                    Ok(f) => f,
-                    Err(_) => break,
-                };
+                if read_frame_into(&mut reader, &mut frame_buf).await.is_err() {
+                    break;
+                }
 
-                match this.auth.unwrap_frame(&frame) {
+                match this.auth.unwrap_frame(&frame_buf) {
                     Ok(UnwrappedFrame::Data { conn_id, payload }) => {
                         if !conn.authenticated.load(Ordering::Relaxed) {
                             continue;
