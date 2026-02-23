@@ -8,20 +8,22 @@ use crate::{
     packet::Packet,
     router::Router,
     tcp_frame::{read_frame_into, write_frame},
+    timefmt::{format_from_elapsed, format_system_time},
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
+use serde_json::{json, Value};
 use socket2::SockRef;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -32,11 +34,14 @@ use tracing::{debug, info};
 
 struct TunnelListenConn {
     tx: mpsc::Sender<Bytes>,
+    remote_addr: String,
     authenticated: AtomicBool,
     conn_id_hint: AtomicU64,
     forward_id: AtomicU64,
     pool_id: AtomicU64,
+    heartbeat_miss_count: AtomicU32,
     last_active: RwLock<Instant>,
+    last_heartbeat_at: RwLock<Option<SystemTime>>,
     last_heartbeat_sent: RwLock<Option<Instant>>,
 }
 
@@ -95,11 +100,22 @@ impl TcpTunnelListenComponent {
             };
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             info!("{} accepted TCP tunnel from {}", self.tag, remote);
-            tokio::spawn(Arc::clone(&self).handle_stream(Arc::clone(&router), id, stream));
+            tokio::spawn(Arc::clone(&self).handle_stream(
+                Arc::clone(&router),
+                id,
+                stream,
+                remote.to_string(),
+            ));
         }
     }
 
-    async fn handle_stream(self: Arc<Self>, router: Arc<Router>, id: u64, stream: TcpStream) {
+    async fn handle_stream(
+        self: Arc<Self>,
+        router: Arc<Router>,
+        id: u64,
+        stream: TcpStream,
+        remote_addr: String,
+    ) {
         let std_stream = match stream.into_std() {
             Ok(s) => s,
             Err(err) => {
@@ -126,11 +142,14 @@ impl TcpTunnelListenComponent {
 
         let conn = Arc::new(TunnelListenConn {
             tx,
+            remote_addr,
             authenticated: AtomicBool::new(false),
             conn_id_hint: AtomicU64::new(0),
             forward_id: AtomicU64::new(0),
             pool_id: AtomicU64::new(0),
+            heartbeat_miss_count: AtomicU32::new(0),
             last_active: RwLock::new(Instant::now()),
+            last_heartbeat_at: RwLock::new(None),
             last_heartbeat_sent: RwLock::new(None),
         });
 
@@ -196,12 +215,14 @@ impl TcpTunnelListenComponent {
                         let hb = self.auth.create_heartbeat(true);
                         Self::send_frame(&conn.tx, hb, self.send_timeout).await;
                         *conn.last_active.write().await = Instant::now();
+                        *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
                     }
                     MSG_TYPE_HEARTBEAT_ACK => {
                         let mut lock = conn.last_heartbeat_sent.write().await;
                         if let Some(ts) = lock.take() {
                             self.auth.record_delay(ts.elapsed()).await;
                         }
+                        *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
                     }
                     _ => {}
                 },
@@ -224,12 +245,76 @@ impl TcpTunnelListenComponent {
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
+
+    pub fn api_info(&self) -> Value {
+        json!({
+            "tag": self.tag,
+            "type": "tcp_tunnel_listen",
+            "listen_addr": self.listen_addr,
+            "detour": self.detour.to_vec(),
+        })
+    }
+
+    pub async fn api_connections(&self) -> Value {
+        let mut grouped: HashMap<(u64, u64), Vec<Value>> = HashMap::new();
+
+        for conn in self.conns.iter() {
+            let forward_id = conn.forward_id.load(Ordering::Relaxed);
+            let pool_id = conn.pool_id.load(Ordering::Relaxed);
+            let last_active = format_from_elapsed(conn.last_active.read().await.elapsed());
+            let last_heartbeat = conn
+                .last_heartbeat_at
+                .read()
+                .await
+                .as_ref()
+                .map(|v| format_system_time(*v));
+            let item = json!({
+                "remote_addr": conn.remote_addr.clone(),
+                "is_authenticated": conn.authenticated.load(Ordering::Relaxed),
+                "last_active": last_active,
+                "heartbeat_miss": conn.heartbeat_miss_count.load(Ordering::Relaxed),
+                "last_heartbeat": last_heartbeat,
+            });
+
+            grouped.entry((forward_id, pool_id)).or_default().push(item);
+        }
+
+        let mut pools = Vec::with_capacity(grouped.len());
+        let mut total_connections = 0usize;
+        for ((forward_id, pool_id), connections) in grouped {
+            let remote_addr = connections
+                .first()
+                .and_then(|v| v.get("remote_addr"))
+                .cloned()
+                .unwrap_or(json!(""));
+            total_connections += connections.len();
+            pools.push(json!({
+                "forward_id": format!("{forward_id:016x}"),
+                "pool_id": format!("{pool_id:016x}"),
+                "remote_addr": remote_addr,
+                "connections": connections,
+                "conn_count": connections.len(),
+            }));
+        }
+
+        json!({
+            "tag": self.tag,
+            "listen_addr": self.listen_addr,
+            "pools": pools,
+            "total_connections": total_connections,
+            "average_delay_ms": self.auth.average_delay_ms().await,
+        })
+    }
 }
 
 #[async_trait]
 impl Component for TcpTunnelListenComponent {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn start(self: Arc<Self>, router: Arc<Router>) -> Result<()> {

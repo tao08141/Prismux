@@ -7,17 +7,22 @@ use crate::{
     config::ComponentConfig,
     packet::Packet,
     router::Router,
+    timefmt::format_system_time,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
+use serde_json::{json, Value};
 use socket2::SockRef;
 use std::{
     net::{SocketAddr, UdpSocket as StdUdpSocket},
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
-    time::{Duration, Instant},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     net::UdpSocket,
@@ -30,6 +35,10 @@ struct ForwardPeer {
     addr: SocketAddr,
     socket: Arc<UdpSocket>,
     authenticated: AtomicBool,
+    auth_retry_count: AtomicU32,
+    heartbeat_miss_count: AtomicU32,
+    last_reconnect_at: SystemTime,
+    last_heartbeat_at: RwLock<Option<SystemTime>>,
     last_heartbeat_sent: RwLock<Option<Instant>>,
 }
 
@@ -84,7 +93,11 @@ impl ForwardComponent {
     }
 
     async fn create_peer(&self, addr: SocketAddr) -> Result<Arc<ForwardPeer>> {
-        let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind_addr = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let std_socket = StdUdpSocket::bind(bind_addr)?;
         std_socket.set_nonblocking(true)?;
         let sock_ref = SockRef::from(&std_socket);
@@ -97,12 +110,17 @@ impl ForwardComponent {
             addr,
             socket,
             authenticated: AtomicBool::new(false),
+            auth_retry_count: AtomicU32::new(0),
+            heartbeat_miss_count: AtomicU32::new(0),
+            last_reconnect_at: SystemTime::now(),
+            last_heartbeat_at: RwLock::new(None),
             last_heartbeat_sent: RwLock::new(None),
         }))
     }
 
     async fn read_loop(self: Arc<Self>, router: Arc<Router>, peer: Arc<ForwardPeer>) {
-        let mut buffer = vec![0u8; router.config.buffer_size.max(2048) + router.config.buffer_offset];
+        let mut buffer =
+            vec![0u8; router.config.buffer_size.max(2048) + router.config.buffer_offset];
 
         while self.running.load(Ordering::Relaxed) {
             let recv = peer.socket.recv(&mut buffer).await;
@@ -126,9 +144,8 @@ impl ForwardComponent {
                             conn_id,
                             proto: None,
                         };
-                        if let Err(err) = router
-                            .route_shared(packet, Arc::clone(&self.detour))
-                            .await
+                        if let Err(err) =
+                            router.route_shared(packet, Arc::clone(&self.detour)).await
                         {
                             debug!("{} route dropped: {err}", self.tag);
                         }
@@ -142,12 +159,16 @@ impl ForwardComponent {
                         MSG_TYPE_HEARTBEAT => {
                             let hb = auth.create_heartbeat(true);
                             let _ = peer.socket.send(&hb).await;
+                            let mut ts = peer.last_heartbeat_at.write().await;
+                            *ts = Some(SystemTime::now());
                         }
                         MSG_TYPE_HEARTBEAT_ACK => {
                             let mut lock = peer.last_heartbeat_sent.write().await;
                             if let Some(sent) = lock.take() {
                                 auth.record_delay(sent.elapsed()).await;
                             }
+                            let mut ts = peer.last_heartbeat_at.write().await;
+                            *ts = Some(SystemTime::now());
                         }
                         MSG_TYPE_DATA => {}
                         _ => {}
@@ -162,10 +183,7 @@ impl ForwardComponent {
                     conn_id: 0,
                     proto: None,
                 };
-                if let Err(err) = router
-                    .route_shared(packet, Arc::clone(&self.detour))
-                    .await
-                {
+                if let Err(err) = router.route_shared(packet, Arc::clone(&self.detour)).await {
                     debug!("{} route dropped: {err}", self.tag);
                 }
             }
@@ -198,14 +216,24 @@ impl ForwardComponent {
                         let hb = auth.create_heartbeat(false);
                         let _ = peer.socket.send(&hb).await;
                         let mut last = peer.last_heartbeat_sent.write().await;
+                        if last.is_some() {
+                            peer.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+                        }
                         *last = Some(Instant::now());
+                        let mut ts = peer.last_heartbeat_at.write().await;
+                        *ts = Some(SystemTime::now());
                     } else {
                         let mut pool_id = [0u8; 8];
                         rand::thread_rng().fill(&mut pool_id);
                         if let Ok(challenge) = auth
-                            .create_auth_challenge(crate::auth::MSG_TYPE_AUTH_CHALLENGE, self.forward_id, pool_id)
+                            .create_auth_challenge(
+                                crate::auth::MSG_TYPE_AUTH_CHALLENGE,
+                                self.forward_id,
+                                pool_id,
+                            )
                             .await
                         {
+                            peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
                             let _ = peer.socket.send(&challenge).await;
                         }
                     }
@@ -232,8 +260,13 @@ impl ForwardComponent {
             let mut pool_id = [0u8; 8];
             rand::thread_rng().fill(&mut pool_id);
             let challenge = auth
-                .create_auth_challenge(crate::auth::MSG_TYPE_AUTH_CHALLENGE, self.forward_id, pool_id)
+                .create_auth_challenge(
+                    crate::auth::MSG_TYPE_AUTH_CHALLENGE,
+                    self.forward_id,
+                    pool_id,
+                )
                 .await?;
+            peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
             let _ = peer.socket.send(&challenge).await?;
         } else {
             peer.authenticated.store(true, Ordering::Relaxed);
@@ -242,12 +275,74 @@ impl ForwardComponent {
         self.peers.insert(addr_str.to_string(), Arc::clone(&peer));
         Ok(())
     }
+
+    pub fn api_info(&self) -> Value {
+        json!({
+            "tag": self.tag,
+            "type": "forward",
+            "forwarders": self.forwarders,
+            "reconnect_interval": self.reconnect_interval.as_secs(),
+            "connection_check_time": self.check_interval.as_secs(),
+            "send_keepalive": self.send_keepalive,
+            "detour": self.detour.to_vec(),
+        })
+    }
+
+    pub async fn api_connections(&self) -> Value {
+        let has_auth = self.auth.is_some();
+        let mut connections = Vec::with_capacity(self.forwarders.len());
+        for remote in &self.forwarders {
+            if let Some(peer) = self.peers.get(remote) {
+                let last_heartbeat = peer
+                    .last_heartbeat_at
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|v| format_system_time(*v));
+                let mut entry = json!({
+                    "remote_addr": remote,
+                    "is_connected": true,
+                    "last_reconnect": format_system_time(peer.last_reconnect_at),
+                    "auth_retry_count": peer.auth_retry_count.load(Ordering::Relaxed),
+                    "heartbeat_miss": peer.heartbeat_miss_count.load(Ordering::Relaxed),
+                    "last_heartbeat": last_heartbeat,
+                });
+                if has_auth {
+                    entry["is_authenticated"] = json!(peer.authenticated.load(Ordering::Relaxed));
+                }
+                connections.push(entry);
+            } else {
+                connections.push(json!({
+                    "remote_addr": remote,
+                    "is_connected": false,
+                    "last_reconnect": Value::Null,
+                    "auth_retry_count": 0,
+                    "heartbeat_miss": 0,
+                    "last_heartbeat": Value::Null,
+                }));
+            }
+        }
+
+        let mut out = json!({
+            "tag": self.tag,
+            "connections": connections,
+            "count": connections.len(),
+        });
+        if let Some(auth) = &self.auth {
+            out["average_delay_ms"] = json!(auth.average_delay_ms().await);
+        }
+        out
+    }
 }
 
 #[async_trait]
 impl Component for ForwardComponent {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn start(self: Arc<Self>, router: Arc<Router>) -> Result<()> {

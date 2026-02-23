@@ -12,9 +12,9 @@ The `ip_router` component routes by source IP/CIDR. First match wins; otherwise 
 | `tag` | Yes | - | Unique component identifier. |
 | `rules` | No | `[]` | Routing rule list (first match wins). |
 | `detour_miss` | No | `[]` | Fallback targets when no rule matches. |
-| `geoip_mmdb` | No | `""` | Reserved field, not used in current implementation. |
-| `geoip_url` | No | `""` | Reserved field, not used in current implementation. |
-| `geoip_update_interval` | No | `""` | Reserved field, not used in current implementation. |
+| `geoip_mmdb` | No | `""` | Local MMDB path. If present, loaded at startup. |
+| `geoip_url` | No | `""` | Remote MMDB URL used for manual/API updates and periodic refresh. |
+| `geoip_update_interval` | No | `""` | GeoIP refresh interval. Supports seconds (`86400`) or suffix (`1h`, `30m`, `2d`). |
 
 ### Rule Item
 
@@ -42,11 +42,12 @@ The `ip_router` component routes by source IP/CIDR. First match wins; otherwise 
 2. Evaluates rules in order:
    - `IP`: exact match,
    - `CIDR`: contains match,
-   - `geo:*`: currently treated as non-match.
+   - `geo:*`: country code match (`geo:US`, `geo:CN`) when GeoIP DB is loaded.
 3. On first match, forwards and returns.
 4. If no match (or source address missing), forwards via `detour_miss`.
 
 ## Notes
 
-- `geo:*` syntax is accepted but GeoIP matching is not active in current Rust build.
+- `POST /api/ip_router_action/{tag}?action=geoip_update` triggers GeoIP download and hot-reload.
+- If both `geoip_mmdb` and `geoip_url` are set, local DB is loaded first, then URL updates can replace it.
 - If `detour_miss` is empty, unmatched packets are dropped.

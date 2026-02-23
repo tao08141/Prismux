@@ -8,20 +8,22 @@ use crate::{
     packet::Packet,
     router::Router,
     tcp_frame::{read_frame_into, write_frame},
+    timefmt::{format_from_elapsed, format_system_time},
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
+use serde_json::{json, Value};
 use socket2::SockRef;
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     net::TcpStream,
@@ -34,6 +36,10 @@ struct TunnelForwardConn {
     tx: mpsc::Sender<Bytes>,
     authenticated: AtomicBool,
     pool_id: [u8; 8],
+    remote_addr: String,
+    heartbeat_miss_count: AtomicU32,
+    last_active: RwLock<Instant>,
+    last_heartbeat_at: RwLock<Option<SystemTime>>,
     last_heartbeat_sent: RwLock<Option<Instant>>,
 }
 
@@ -134,7 +140,12 @@ impl TcpTunnelForwardComponent {
                     if conn.authenticated.load(Ordering::Relaxed) {
                         let hb = self.auth.create_heartbeat(false);
                         Self::send_frame(&conn.tx, hb, self.send_timeout).await;
-                        *conn.last_heartbeat_sent.write().await = Some(Instant::now());
+                        let mut sent = conn.last_heartbeat_sent.write().await;
+                        if sent.is_some() {
+                            conn.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *sent = Some(Instant::now());
+                        *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
                     }
                 }
             }
@@ -165,6 +176,10 @@ impl TcpTunnelForwardComponent {
             tx,
             authenticated: AtomicBool::new(false),
             pool_id: target.pool_id,
+            remote_addr: target.addr.clone(),
+            heartbeat_miss_count: AtomicU32::new(0),
+            last_active: RwLock::new(Instant::now()),
+            last_heartbeat_at: RwLock::new(None),
             last_heartbeat_sent: RwLock::new(None),
         });
 
@@ -206,6 +221,7 @@ impl TcpTunnelForwardComponent {
                         if !conn.authenticated.load(Ordering::Relaxed) {
                             continue;
                         }
+                        *conn.last_active.write().await = Instant::now();
                         let packet = Packet {
                             data: payload,
                             src_tag: Arc::clone(&this.tag_arc),
@@ -224,12 +240,16 @@ impl TcpTunnelForwardComponent {
                         MSG_TYPE_HEARTBEAT => {
                             let hb = this.auth.create_heartbeat(true);
                             Self::send_frame(&conn.tx, hb, this.send_timeout).await;
+                            *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                            *conn.last_active.write().await = Instant::now();
                         }
                         MSG_TYPE_HEARTBEAT_ACK => {
                             let mut lock = conn.last_heartbeat_sent.write().await;
                             if let Some(ts) = lock.take() {
                                 this.auth.record_delay(ts.elapsed()).await;
                             }
+                            *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                            *conn.last_active.write().await = Instant::now();
                         }
                         _ => {}
                     },
@@ -268,12 +288,74 @@ impl TcpTunnelForwardComponent {
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
+
+    pub fn api_info(&self) -> Value {
+        let forwarders = self
+            .targets
+            .iter()
+            .map(|target| format!("{}:{}", target.addr, target.desired))
+            .collect::<Vec<_>>();
+
+        json!({
+            "tag": self.tag,
+            "type": "tcp_tunnel_forward",
+            "forwarders": forwarders,
+            "connection_check_time": self.check_interval.as_secs(),
+            "detour": self.detour.to_vec(),
+        })
+    }
+
+    pub async fn api_connections(&self) -> Value {
+        let mut pools = Vec::with_capacity(self.targets.len());
+        let mut total_connections = 0usize;
+
+        for target in &self.targets {
+            let mut connections = Vec::new();
+            for conn in target.conns.iter() {
+                let last_heartbeat = conn
+                    .last_heartbeat_at
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|v| format_system_time(*v));
+                connections.push(json!({
+                    "connection_id": conn.key(),
+                    "remote_addr": conn.remote_addr,
+                    "is_authenticated": conn.authenticated.load(Ordering::Relaxed),
+                    "last_active": format_from_elapsed(conn.last_active.read().await.elapsed()),
+                    "heartbeat_miss": conn.heartbeat_miss_count.load(Ordering::Relaxed),
+                    "last_heartbeat": last_heartbeat,
+                }));
+            }
+
+            total_connections += connections.len();
+            pools.push(json!({
+                "pool_id": format!("{:016x}", u64::from_be_bytes(target.pool_id)),
+                "remote_addr": target.addr,
+                "connections": connections,
+                "conn_count": connections.len(),
+                "target_count": target.desired,
+            }));
+        }
+
+        json!({
+            "tag": self.tag,
+            "forward_id": format!("{:016x}", u64::from_be_bytes(self.forward_id)),
+            "pools": pools,
+            "total_connections": total_connections,
+            "average_delay_ms": self.auth.average_delay_ms().await,
+        })
+    }
 }
 
 #[async_trait]
 impl Component for TcpTunnelForwardComponent {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn start(self: Arc<Self>, router: Arc<Router>) -> Result<()> {

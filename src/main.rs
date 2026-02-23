@@ -1,3 +1,4 @@
+mod api_server;
 mod auth;
 mod component;
 mod components;
@@ -6,12 +7,14 @@ mod packet;
 mod protocol_detector;
 mod router;
 mod tcp_frame;
+mod timefmt;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use component::Component;
 use config::{
-    ComponentConfig, Config, FilterComponentConfig, IPRouteComponentConfig, LoadBalancerComponentConfig,
+    ComponentConfig, Config, FilterComponentConfig, IPRouteComponentConfig,
+    LoadBalancerComponentConfig,
 };
 use protocol_detector::ProtocolDetector;
 use router::Router;
@@ -20,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser, Debug)]
@@ -50,13 +53,18 @@ async fn main() -> Result<()> {
 
     router.start().await?;
 
-    if config.api.enabled {
-        warn!("API server requested but not enabled in this Rust refactor build");
-    }
+    let api_server = if config.api.enabled {
+        Some(api_server::ApiServer::start(config.api.clone(), Arc::clone(&router)).await?)
+    } else {
+        None
+    };
 
     info!("UDPlex started and ready");
 
     tokio::signal::ctrl_c().await?;
+    if let Some(server) = api_server {
+        server.stop().await;
+    }
     router.shutdown();
     Ok(())
 }

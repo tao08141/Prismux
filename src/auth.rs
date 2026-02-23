@@ -1,6 +1,6 @@
 use crate::config::AuthConfig;
 use aes_gcm::{
-    aead::{AeadInPlace, KeyInit, OsRng, rand_core::RngCore},
+    aead::{rand_core::RngCore, AeadInPlace, KeyInit, OsRng},
     Aes128Gcm, Nonce, Tag,
 };
 use anyhow::{anyhow, Context, Result};
@@ -34,7 +34,8 @@ const NONCE_SIZE: usize = 12;
 const FORWARD_ID_SIZE: usize = 8;
 const POOL_ID_SIZE: usize = 8;
 const CONN_ID_SIZE: usize = 8;
-pub const HANDSHAKE_SIZE: usize = CHALLENGE_SIZE + FORWARD_ID_SIZE + POOL_ID_SIZE + TIMESTAMP_SIZE + MAC_SIZE;
+pub const HANDSHAKE_SIZE: usize =
+    CHALLENGE_SIZE + FORWARD_ID_SIZE + POOL_ID_SIZE + TIMESTAMP_SIZE + MAC_SIZE;
 
 #[derive(Clone, Debug)]
 pub struct ProtocolHeader {
@@ -102,12 +103,21 @@ impl AuthManager {
 
     pub fn create_heartbeat(&self, ack: bool) -> Bytes {
         let mut out = BytesMut::with_capacity(HEADER_SIZE);
-        let msg = if ack { MSG_TYPE_HEARTBEAT_ACK } else { MSG_TYPE_HEARTBEAT };
+        let msg = if ack {
+            MSG_TYPE_HEARTBEAT_ACK
+        } else {
+            MSG_TYPE_HEARTBEAT
+        };
         write_header(&mut out, msg, 0);
         out.freeze()
     }
 
-    pub async fn create_auth_challenge(&self, msg_type: u8, forward_id: [u8; 8], pool_id: [u8; 8]) -> Result<Bytes> {
+    pub async fn create_auth_challenge(
+        &self,
+        msg_type: u8,
+        forward_id: [u8; 8],
+        pool_id: [u8; 8],
+    ) -> Result<Bytes> {
         let mut challenge = [0u8; CHALLENGE_SIZE];
         OsRng.fill_bytes(&mut challenge);
 
@@ -150,7 +160,9 @@ impl AuthManager {
         }
 
         let mut offset = CHALLENGE_SIZE;
-        let forward_id: [u8; 8] = payload[offset..offset + FORWARD_ID_SIZE].try_into().unwrap();
+        let forward_id: [u8; 8] = payload[offset..offset + FORWARD_ID_SIZE]
+            .try_into()
+            .unwrap();
         offset += FORWARD_ID_SIZE;
         let pool_id: [u8; 8] = payload[offset..offset + POOL_ID_SIZE].try_into().unwrap();
         offset += POOL_ID_SIZE;
@@ -213,7 +225,11 @@ impl AuthManager {
             Ok(out.freeze())
         } else {
             let mut out = BytesMut::with_capacity(HEADER_SIZE + CONN_ID_SIZE + payload.len());
-            write_header(&mut out, MSG_TYPE_DATA, (CONN_ID_SIZE + payload.len()) as u32);
+            write_header(
+                &mut out,
+                MSG_TYPE_DATA,
+                (CONN_ID_SIZE + payload.len()) as u32,
+            );
             out.extend_from_slice(&conn_id.to_be_bytes());
             out.extend_from_slice(payload);
             Ok(out.freeze())
@@ -233,7 +249,10 @@ impl AuthManager {
         let body = &frame[HEADER_SIZE..HEADER_SIZE + header.length as usize];
 
         if header.msg_type != MSG_TYPE_DATA {
-            return Ok(UnwrappedFrame::Control { header, payload: Bytes::copy_from_slice(body) });
+            return Ok(UnwrappedFrame::Control {
+                header,
+                payload: Bytes::copy_from_slice(body),
+            });
         }
 
         if self.enable_encryption {
@@ -266,7 +285,11 @@ impl AuthManager {
                 return Err(anyhow!("data timestamp expired"));
             }
 
-            let conn_id = u64::from_be_bytes(plaintext[TIMESTAMP_SIZE..TIMESTAMP_SIZE + CONN_ID_SIZE].try_into().unwrap());
+            let conn_id = u64::from_be_bytes(
+                plaintext[TIMESTAMP_SIZE..TIMESTAMP_SIZE + CONN_ID_SIZE]
+                    .try_into()
+                    .unwrap(),
+            );
             let plaintext = Bytes::from(plaintext);
             let payload = plaintext.slice(TIMESTAMP_SIZE + CONN_ID_SIZE..);
             Ok(UnwrappedFrame::Data { conn_id, payload })
@@ -336,6 +359,12 @@ fn now_millis() -> i64 {
 }
 
 pub enum UnwrappedFrame {
-    Data { conn_id: u64, payload: Bytes },
-    Control { header: ProtocolHeader, payload: Bytes },
+    Data {
+        conn_id: u64,
+        payload: Bytes,
+    },
+    Control {
+        header: ProtocolHeader,
+        payload: Bytes,
+    },
 }

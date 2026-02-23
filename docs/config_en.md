@@ -18,10 +18,10 @@ Prismux accepts YAML or JSON config files. If extension is `.yaml/.yml`, YAML is
 | `logging.format` | `string` | `console` | `console` or `json`. |
 | `logging.output_path` | `string` | `stdout` | Reserved field, not actively used for output redirection yet. |
 | `logging.caller` | `bool` | `false` | Reserved field, not active yet. |
-| `api.enabled` | `bool` | `false` | Reserved field, API server is not implemented in current Rust build. |
-| `api.port` | `u16` | `0` | Reserved field. |
-| `api.host` | `string` | `""` | Reserved field. |
-| `api.h5_files_path` | `string` | `""` | Reserved field. |
+| `api.enabled` | `bool` | `false` | Enable built-in REST API server. |
+| `api.port` | `u16` | `0` | API listen port (`0` maps to `8080`). |
+| `api.host` | `string` | `""` | API listen host (`""` maps to `0.0.0.0`). |
+| `api.h5_files_path` | `string` | `""` | Optional static file directory served under `/h5/`. |
 
 ## Component Types
 

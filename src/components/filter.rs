@@ -1,12 +1,10 @@
 use crate::{
-    component::Component,
-    config::FilterComponentConfig,
-    packet::Packet,
-    protocol_detector::ProtocolDetector,
-    router::Router,
+    component::Component, config::FilterComponentConfig, packet::Packet,
+    protocol_detector::ProtocolDetector, router::Router,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
 
 pub struct FilterComponent {
@@ -31,12 +29,31 @@ impl FilterComponent {
             detector,
         })
     }
+
+    pub fn api_info(&self) -> Value {
+        let mut detour = serde_json::Map::new();
+        for (proto, targets) in &self.detour {
+            detour.insert(proto.clone(), json!(targets.to_vec()));
+        }
+
+        json!({
+            "tag": self.tag,
+            "type": "filter",
+            "use_proto_detectors": self.use_detectors,
+            "detour": detour,
+            "detour_miss": self.detour_miss.to_vec(),
+        })
+    }
 }
 
 #[async_trait]
 impl Component for FilterComponent {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn start(self: Arc<Self>, _router: Arc<Router>) -> Result<()> {

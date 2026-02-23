@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use evalexpr::{build_operator_tree, ContextWithMutableVariables, HashMapContext, Node, Value};
+use serde_json::{json, Value as JsonValue};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -125,7 +126,8 @@ impl LoadBalancerComponent {
     fn compile_rule(rule: LoadBalancerDetourRule) -> Result<CompiledRule> {
         let available_tags = extract_tag_vars(&rule.rule, "available_");
         let delay_tags = extract_tag_vars(&rule.rule, "delay_");
-        let uses_traffic_stats = has_identifier(&rule.rule, "bps") || has_identifier(&rule.rule, "pps");
+        let uses_traffic_stats =
+            has_identifier(&rule.rule, "bps") || has_identifier(&rule.rule, "pps");
         let exec = if let Some(fast) = parse_fast_rule(&rule.rule) {
             RuleExec::Fast(fast)
         } else {
@@ -290,12 +292,40 @@ impl LoadBalancerComponent {
 
         selected
     }
+
+    pub async fn api_traffic(&self) -> JsonValue {
+        let (bits_per_sec, packets_per_sec) = self.current_bps_pps();
+        let current_bytes = self.current_bytes.load(Ordering::Relaxed);
+        let current_packets = self.current_packets.load(Ordering::Relaxed);
+        let stats = self.stats.lock().await;
+        let samples = stats
+            .samples
+            .iter()
+            .map(|s| json!({"bytes": s.bytes, "packets": s.packets}))
+            .collect::<Vec<_>>();
+
+        json!({
+            "tag": self.tag,
+            "bits_per_sec": bits_per_sec,
+            "packets_per_sec": packets_per_sec,
+            "total_bytes": stats.total_bytes + current_bytes,
+            "total_packets": stats.total_packets + current_packets,
+            "current_bytes": current_bytes,
+            "current_packets": current_packets,
+            "samples": samples,
+            "window_size": stats.samples.len(),
+        })
+    }
 }
 
 #[async_trait]
 impl Component for LoadBalancerComponent {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn start(self: Arc<Self>, _router: Arc<Router>) -> Result<()> {
@@ -324,9 +354,7 @@ impl Component for LoadBalancerComponent {
         let targets = self.evaluate_targets(router, seq, size, bps, pps).await;
         if targets.is_empty() {
             if !self.miss.is_empty() {
-                router
-                    .route_shared(packet, Arc::clone(&self.miss))
-                    .await?;
+                router.route_shared(packet, Arc::clone(&self.miss)).await?;
             }
             return Ok(());
         }
@@ -438,4 +466,3 @@ fn parse_seq_mod_eq(expr: &str) -> Option<(u64, u64)> {
     }
     Some((modulo, equals))
 }
-

@@ -65,9 +65,15 @@ impl ProtocolDetector {
         }
 
         if proto.match_all {
-            proto.signatures.iter().all(|sig| self.matches_signature(data, sig))
+            proto
+                .signatures
+                .iter()
+                .all(|sig| self.matches_signature(data, sig))
         } else {
-            proto.signatures.iter().any(|sig| self.matches_signature(data, sig))
+            proto
+                .signatures
+                .iter()
+                .any(|sig| self.matches_signature(data, sig))
         }
     }
 
@@ -92,7 +98,9 @@ impl ProtocolDetector {
                         return false;
                     }
                 }
-            } else if &data[sig.rule.offset..sig.rule.offset + sig.bytes.len()] != sig.bytes.as_slice() {
+            } else if &data[sig.rule.offset..sig.rule.offset + sig.bytes.len()]
+                != sig.bytes.as_slice()
+            {
                 return false;
             }
         }
