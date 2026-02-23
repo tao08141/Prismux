@@ -18,6 +18,7 @@ This directory follows a UDPlex-style structure for Prismux (Rust refactor) docs
 - [TCP Tunnel Forward Component](tcp_tunnel_forward_en.md)
 - [Auth Protocol](auth_protocol_en.md)
 - [Protocol Detector](protocol_detector_en.md)
+- [Prismux + WireGuard Deployment](prismux_wireguard_en.md)
 
 ## Current Rust Refactor Status
 

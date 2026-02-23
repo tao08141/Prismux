@@ -40,6 +40,7 @@ docker run -d --name prismux --network host \
 - [TCP Tunnel Forward 组件](docs/tcp_tunnel_forward_zh.md)
 - [鉴权协议](docs/auth_protocol_zh.md)
 - [协议检测器](docs/protocol_detector_zh.md)
+- [Prismux + WireGuard 一键部署](docs/prismux_wireguard_zh.md)
 
 ## 指标与测试
 

@@ -39,6 +39,7 @@ docker run -d --name prismux --network host \
 - [TCP Tunnel Forward Component](docs/tcp_tunnel_forward_en.md)
 - [Auth Protocol](docs/auth_protocol_en.md)
 - [Protocol Detector](docs/protocol_detector_en.md)
+- [Prismux + WireGuard Deployment](docs/prismux_wireguard_en.md)
 - [Chinese Documentation](docs/README_ZH.md)
 
 ## Metrics
