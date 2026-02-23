@@ -16,6 +16,7 @@ RUN useradd --system --uid 10001 --create-home prismux
 WORKDIR /app
 COPY --from=builder /build/target/release/prismux /usr/local/bin/prismux
 COPY examples /app/examples
+COPY h5 /app/h5
 RUN cp /app/examples/basic.yaml /app/config.yaml \
     && chown -R prismux:prismux /app
 
