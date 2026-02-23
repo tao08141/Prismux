@@ -265,6 +265,38 @@
             opacity: 1;
         }
 
+        /* 隧道连接池样式 */
+        .pools-container {
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px dashed rgba(255, 255, 255, 0.1);
+        }
+
+        .pool-item {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.75rem;
+        }
+
+        .pool-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.25rem;
+            color: #e2e8f0;
+        }
+
+        .pool-conn {
+            display: flex;
+            justify-content: space-between;
+            color: var(--text-muted);
+            padding: 0.1rem 0;
+            border-left: 2px solid var(--accent);
+            padding-left: 0.25rem;
+            margin-top: 0.2rem;
+        }
+
         /* 自动刷新配置 */
         .auto-refresh-control {
             display: flex;
@@ -438,12 +470,16 @@
         function getDetours(comp) {
             let targets = [];
 
-            // detour 可以是字符串或数组
+            // detour 可以是字符串或数组，也可能是对象（比如 load_balancer 的 target { tag, weight }）
             if (comp.detour) {
                 if (Array.isArray(comp.detour)) {
-                    targets.push(...comp.detour);
+                    comp.detour.forEach(t => {
+                        if (typeof t === 'object' && t !== null && t.tag) targets.push(t.tag);
+                        else if (typeof t === 'string') targets.push(t);
+                    });
                 } else {
-                    targets.push(comp.detour);
+                    if (typeof comp.detour === 'object' && comp.detour !== null && comp.detour.tag) targets.push(comp.detour.tag);
+                    else if (typeof comp.detour === 'string') targets.push(comp.detour);
                 }
             }
             // fallback (有些协议可能会用别名)
@@ -550,9 +586,59 @@
                     detailsHtml += `<p><span class="param-key">每秒包数:</span> ${comp.packets_per_sec}</p>`;
                 }
 
-                const detours = getDetours(comp);
-                if (detours.length > 0) {
-                    detailsHtml += `<p><span class="param-key">出口:</span> <span style="color: var(--highlight-border)">${detours.join(', ')}</span></p>`;
+                // 出口显示处理（支持 load_balancer 的权重对象）
+                let displayRoutes = [];
+                if (comp.detour) {
+                    if (Array.isArray(comp.detour)) {
+                        comp.detour.forEach(d => {
+                            if (typeof d === 'string') displayRoutes.push(d);
+                            else if (typeof d === 'object' && d !== null && d.tag) {
+                                displayRoutes.push(`${d.tag}${d.weight ? ` (w:${d.weight})` : ''}`);
+                            } else {
+                                displayRoutes.push(JSON.stringify(d));
+                            }
+                        });
+                    } else if (typeof comp.detour === 'string') {
+                        displayRoutes.push(comp.detour);
+                    } else if (typeof comp.detour === 'object' && comp.detour !== null && comp.detour.tag) {
+                        displayRoutes.push(`${comp.detour.tag}${comp.detour.weight ? ` (w:${comp.detour.weight})` : ''}`);
+                    }
+                }
+
+                if (displayRoutes.length > 0) {
+                    detailsHtml += `<p><span class="param-key">出口:</span> <span style="color: var(--highlight-border)">${displayRoutes.join(', ')}</span></p>`;
+                }
+
+                if (comp.detour_miss) {
+                    detailsHtml += `<p><span class="param-key">Miss 出口:</span> <span style="color: var(--danger)">${comp.detour_miss}</span></p>`;
+                }
+
+                // TCP Tunnel 连接池展示
+                if (comp.pools && Array.isArray(comp.pools) && comp.pools.length > 0) {
+                    detailsHtml += `<div class="pools-container">`;
+                    comp.pools.forEach(pool => {
+                        detailsHtml += `<div class="pool-item">
+                            <div class="pool-header">
+                                <span>池 ID: ${pool.pool_id ? pool.pool_id.substring(0, 8) : 'N/A'}</span>
+                                <span style="color: var(--highlight-border)">连接: ${pool.conn_count}</span>
+                            </div>`;
+
+                        if (pool.connections && Array.isArray(pool.connections)) {
+                            // 最多展示前 3 个连接防止卡片太长
+                            const showConns = pool.connections.slice(0, 3);
+                            showConns.forEach(conn => {
+                                detailsHtml += `<div class="pool-conn">
+                                    <span>${conn.remote_addr || '未知地址'}</span>
+                                    <span>${conn.is_authenticated ? '<span style="color: var(--success)">已认证</span>' : '<span style="color: var(--danger)">未认证</span>'}</span>
+                                </div>`;
+                            });
+                            if (pool.connections.length > 3) {
+                                detailsHtml += `<div class="pool-conn" style="border-left-color: transparent; justify-content: center;">... 还有 ${pool.connections.length - 3} 个连接</div>`;
+                            }
+                        }
+                        detailsHtml += `</div>`;
+                    });
+                    detailsHtml += `</div>`;
                 }
 
                 card.innerHTML = `

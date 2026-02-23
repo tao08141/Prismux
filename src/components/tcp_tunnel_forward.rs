@@ -18,7 +18,6 @@ use rand::Rng;
 use serde_json::{json, Value};
 use socket2::SockRef;
 use std::{
-    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -28,7 +27,7 @@ use std::{
 use tokio::{
     net::TcpStream,
     sync::{mpsc, RwLock},
-    time,
+    time::{self, MissedTickBehavior},
 };
 use tracing::{debug, info};
 
@@ -122,35 +121,53 @@ impl TcpTunnelForwardComponent {
     }
 
     async fn maintain(self: Arc<Self>, router: Arc<Router>) {
+        let mut check_ticker = time::interval(self.check_interval);
+        check_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut hb_ticker = time::interval(self.auth.heartbeat_interval);
+        hb_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         while self.running.load(Ordering::Relaxed) {
-            for target in &self.targets {
-                while target.conns.len() < target.desired {
-                    if let Err(err) = self
-                        .connect_one(Arc::clone(target), Arc::clone(&router))
-                        .await
-                    {
-                        debug!("{} connect {} failed: {err}", self.tag, target.addr);
-                        break;
-                    }
-                }
-            }
-
-            for target in &self.targets {
-                for conn in target.conns.iter() {
-                    if conn.authenticated.load(Ordering::Relaxed) {
-                        let hb = self.auth.create_heartbeat(false);
-                        Self::send_frame(&conn.tx, hb, self.send_timeout).await;
-                        let mut sent = conn.last_heartbeat_sent.write().await;
-                        if sent.is_some() {
-                            conn.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                _ = check_ticker.tick() => {
+                    for target in &self.targets {
+                        while target.conns.len() < target.desired {
+                            if let Err(err) = self
+                                .connect_one(Arc::clone(target), Arc::clone(&router))
+                                .await
+                            {
+                                debug!("{} connect {} failed: {err}", self.tag, target.addr);
+                                break;
+                            }
                         }
-                        *sent = Some(Instant::now());
-                        *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                    }
+                }
+                _ = hb_ticker.tick() => {
+                    for target in &self.targets {
+                        for conn in target.conns.iter() {
+                            if conn.authenticated.load(Ordering::Relaxed) {
+                                let hb = self.auth.create_heartbeat(false);
+                                Self::send_frame(&conn.tx, hb, self.send_timeout).await;
+                                let mut sent = conn.last_heartbeat_sent.write().await;
+                                if sent.is_some() {
+                                    conn.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+                                }
+                                *sent = Some(Instant::now());
+                                *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                            } else if let Ok(challenge) = self
+                                .auth
+                                .create_auth_challenge(
+                                    crate::auth::MSG_TYPE_AUTH_CHALLENGE,
+                                    self.forward_id,
+                                    conn.pool_id,
+                                )
+                                .await
+                            {
+                                Self::send_frame(&conn.tx, challenge, self.send_timeout).await;
+                            }
+                        }
                     }
                 }
             }
-
-            time::sleep(self.check_interval).await;
         }
     }
 
@@ -392,20 +409,80 @@ impl Component for TcpTunnelForwardComponent {
 }
 
 fn parse_forwarder(raw: &str) -> Result<(String, usize)> {
-    let mut count = 4usize;
-    let mut addr_part = raw.trim().to_string();
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return Err(anyhow!("invalid tcp forwarder: {raw}"));
+    }
 
-    if let Some(idx) = addr_part.rfind(':') {
-        let tail = &addr_part[idx + 1..];
-        if let Ok(v) = tail.parse::<usize>() {
-            count = v.max(1);
-            addr_part = addr_part[..idx].to_string();
+    if parse_endpoint(candidate).is_ok() {
+        return Ok((candidate.to_string(), 4));
+    }
+
+    if let Some((addr_part, count_part)) = candidate.rsplit_once(':') {
+        if let Ok(count) = count_part.parse::<usize>() {
+            parse_endpoint(addr_part).map_err(|_| anyhow!("invalid tcp forwarder: {raw}"))?;
+            return Ok((addr_part.to_string(), count.max(1)));
         }
     }
 
-    let addr: SocketAddr = addr_part
-        .parse()
-        .map_err(|_| anyhow!("invalid tcp forwarder: {raw}"))?;
+    Err(anyhow!("invalid tcp forwarder: {raw}"))
+}
 
-    Ok((addr.to_string(), count))
+fn parse_endpoint(addr: &str) -> Result<()> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| anyhow!("invalid tcp endpoint: {addr}"))?;
+        if end == 0 {
+            return Err(anyhow!("invalid tcp endpoint: {addr}"));
+        }
+        let remain = &rest[end + 1..];
+        let port = remain
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow!("invalid tcp endpoint: {addr}"))?;
+        port.parse::<u16>()
+            .map_err(|_| anyhow!("invalid tcp endpoint: {addr}"))?;
+        return Ok(());
+    }
+
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("invalid tcp endpoint: {addr}"))?;
+    if host.is_empty() || host.contains(':') {
+        return Err(anyhow!("invalid tcp endpoint: {addr}"));
+    }
+    port.parse::<u16>()
+        .map_err(|_| anyhow!("invalid tcp endpoint: {addr}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_forwarder;
+
+    #[test]
+    fn parse_forwarder_supports_host_port_without_count() {
+        let (addr, count) = parse_forwarder("edge.example.com:5203").expect("parse host");
+        assert_eq!(addr, "edge.example.com:5203");
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn parse_forwarder_supports_host_port_with_count() {
+        let (addr, count) = parse_forwarder("edge.example.com:5203:8").expect("parse host");
+        assert_eq!(addr, "edge.example.com:5203");
+        assert_eq!(count, 8);
+    }
+
+    #[test]
+    fn parse_forwarder_supports_ipv6_with_count() {
+        let (addr, count) = parse_forwarder("[2001:db8::1]:5203:2").expect("parse ipv6");
+        assert_eq!(addr, "[2001:db8::1]:5203");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_forwarder_rejects_missing_port() {
+        assert!(parse_forwarder("edge.example.com").is_err());
+    }
 }

@@ -25,13 +25,14 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    net::UdpSocket,
+    net::{lookup_host, UdpSocket},
     sync::RwLock,
     time::{self, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
 
 struct ForwardPeer {
+    remote: String,
     addr: SocketAddr,
     socket: Arc<UdpSocket>,
     authenticated: AtomicBool,
@@ -92,7 +93,7 @@ impl ForwardComponent {
         }))
     }
 
-    async fn create_peer(&self, addr: SocketAddr) -> Result<Arc<ForwardPeer>> {
+    async fn create_peer(&self, remote: &str, addr: SocketAddr) -> Result<Arc<ForwardPeer>> {
         let bind_addr = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -107,6 +108,7 @@ impl ForwardComponent {
         socket.connect(addr).await?;
 
         Ok(Arc::new(ForwardPeer {
+            remote: remote.to_string(),
             addr,
             socket,
             authenticated: AtomicBool::new(false),
@@ -190,71 +192,135 @@ impl ForwardComponent {
         }
 
         peer.authenticated.store(false, Ordering::Relaxed);
+        if let Some(current) = self.peers.get(&peer.remote) {
+            if Arc::ptr_eq(current.value(), &peer) {
+                drop(current);
+                self.peers.remove(&peer.remote);
+            }
+        }
     }
 
-    async fn connection_maintenance(self: Arc<Self>) {
-        let mut ticker = time::interval(self.check_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        while self.running.load(Ordering::Relaxed) {
-            ticker.tick().await;
-
-            for addr in &self.forwarders {
-                if !self.peers.contains_key(addr) {
-                    if let Err(err) = self.connect_one(addr).await {
-                        debug!("{} reconnect {} failed: {err}", self.tag, addr);
-                    }
+    async fn reconcile_peers(self: &Arc<Self>, router: &Arc<Router>) {
+        for addr in &self.forwarders {
+            let resolved = match self.resolve_forwarder(addr).await {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    debug!("{} resolve {} failed: {err}", self.tag, addr);
+                    continue;
                 }
-            }
+            };
 
-            if let Some(auth) = &self.auth {
-                for addr in &self.forwarders {
-                    let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
-                        continue;
-                    };
-                    if peer.authenticated.load(Ordering::Relaxed) {
-                        let hb = auth.create_heartbeat(false);
-                        let _ = peer.socket.send(&hb).await;
-                        let mut last = peer.last_heartbeat_sent.write().await;
-                        if last.is_some() {
-                            peer.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        *last = Some(Instant::now());
-                        let mut ts = peer.last_heartbeat_at.write().await;
-                        *ts = Some(SystemTime::now());
-                    } else {
-                        let mut pool_id = [0u8; 8];
-                        rand::thread_rng().fill(&mut pool_id);
-                        if let Ok(challenge) = auth
-                            .create_auth_challenge(
-                                crate::auth::MSG_TYPE_AUTH_CHALLENGE,
-                                self.forward_id,
-                                pool_id,
-                            )
-                            .await
-                        {
-                            peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
-                            let _ = peer.socket.send(&challenge).await;
-                        }
-                    }
+            let needs_connect = match self.peers.get(addr) {
+                Some(peer) if peer.addr == resolved => false,
+                Some(peer) => {
+                    debug!(
+                        "{} forwarder {} changed {} -> {}, reconnecting",
+                        self.tag, addr, peer.addr, resolved
+                    );
+                    true
                 }
-            } else if self.send_keepalive {
-                for addr in &self.forwarders {
-                    let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
-                        continue;
-                    };
-                    let _ = peer.socket.send(&[]).await;
+                None => true,
+            };
+
+            if needs_connect {
+                if let Some((_, old_peer)) = self.peers.remove(addr) {
+                    old_peer.authenticated.store(false, Ordering::Relaxed);
+                }
+                if let Err(err) = self.connect_one(router, addr, resolved).await {
+                    debug!("{} reconnect {} failed: {err}", self.tag, addr);
                 }
             }
         }
     }
 
-    async fn connect_one(self: &Arc<Self>, addr_str: &str) -> Result<()> {
-        let addr: SocketAddr = addr_str
-            .parse()
-            .map_err(|_| anyhow!("invalid forwarder addr {addr_str}"))?;
+    async fn auth_maintenance(&self, auth: &AuthManager) {
+        for addr in &self.forwarders {
+            let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                continue;
+            };
+            if peer.authenticated.load(Ordering::Relaxed) {
+                let hb = auth.create_heartbeat(false);
+                let _ = peer.socket.send(&hb).await;
+                let mut last = peer.last_heartbeat_sent.write().await;
+                if last.is_some() {
+                    peer.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+                }
+                *last = Some(Instant::now());
+                let mut ts = peer.last_heartbeat_at.write().await;
+                *ts = Some(SystemTime::now());
+            } else {
+                let mut pool_id = [0u8; 8];
+                rand::thread_rng().fill(&mut pool_id);
+                if let Ok(challenge) = auth
+                    .create_auth_challenge(
+                        crate::auth::MSG_TYPE_AUTH_CHALLENGE,
+                        self.forward_id,
+                        pool_id,
+                    )
+                    .await
+                {
+                    peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
+                    let _ = peer.socket.send(&challenge).await;
+                }
+            }
+        }
+    }
 
-        let peer = self.create_peer(addr).await?;
+    async fn keepalive_maintenance(&self) {
+        for addr in &self.forwarders {
+            let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
+                continue;
+            };
+            let _ = peer.socket.send(&[]).await;
+        }
+    }
+
+    async fn connection_maintenance(self: Arc<Self>, router: Arc<Router>) {
+        let mut check_ticker = time::interval(self.check_interval);
+        check_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        if let Some(auth) = self.auth.clone() {
+            let mut hb_ticker = time::interval(auth.heartbeat_interval);
+            hb_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            while self.running.load(Ordering::Relaxed) {
+                tokio::select! {
+                    _ = check_ticker.tick() => {
+                        self.reconcile_peers(&router).await;
+                    }
+                    _ = hb_ticker.tick() => {
+                        self.auth_maintenance(&auth).await;
+                    }
+                }
+            }
+            return;
+        }
+
+        while self.running.load(Ordering::Relaxed) {
+            check_ticker.tick().await;
+            self.reconcile_peers(&router).await;
+            if self.send_keepalive {
+                self.keepalive_maintenance().await;
+            }
+        }
+    }
+
+    async fn resolve_forwarder(&self, addr_str: &str) -> Result<SocketAddr> {
+        let mut addrs = lookup_host(addr_str)
+            .await
+            .map_err(|_| anyhow!("invalid forwarder addr {addr_str}"))?;
+        addrs
+            .next()
+            .ok_or_else(|| anyhow!("invalid forwarder addr {addr_str}"))
+    }
+
+    async fn connect_one(
+        self: &Arc<Self>,
+        router: &Arc<Router>,
+        addr_str: &str,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let peer = self.create_peer(addr_str, addr).await?;
 
         if let Some(auth) = &self.auth {
             let mut pool_id = [0u8; 8];
@@ -272,7 +338,10 @@ impl ForwardComponent {
             peer.authenticated.store(true, Ordering::Relaxed);
         }
 
-        self.peers.insert(addr_str.to_string(), Arc::clone(&peer));
+        if let Some(old_peer) = self.peers.insert(addr_str.to_string(), Arc::clone(&peer)) {
+            old_peer.authenticated.store(false, Ordering::Relaxed);
+        }
+        tokio::spawn(Arc::clone(self).read_loop(Arc::clone(router), peer));
         Ok(())
     }
 
@@ -349,19 +418,19 @@ impl Component for ForwardComponent {
         self.running.store(true, Ordering::Relaxed);
 
         for addr in &self.forwarders {
-            if let Err(err) = self.connect_one(addr).await {
+            let resolved = match self.resolve_forwarder(addr).await {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    warn!("{} connect {} failed: {err}", self.tag, addr);
+                    continue;
+                }
+            };
+            if let Err(err) = self.connect_one(&router, addr, resolved).await {
                 warn!("{} connect {} failed: {err}", self.tag, addr);
             }
         }
 
-        for addr in &self.forwarders {
-            let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
-                continue;
-            };
-            tokio::spawn(Arc::clone(&self).read_loop(Arc::clone(&router), peer));
-        }
-
-        tokio::spawn(Arc::clone(&self).connection_maintenance());
+        tokio::spawn(Arc::clone(&self).connection_maintenance(Arc::clone(&router)));
 
         info!("{} forwarding to {:?}", self.tag, self.forwarders);
         Ok(())
@@ -383,6 +452,12 @@ impl Component for ForwardComponent {
             }
             if let Err(err) = peer.socket.send(&payload).await {
                 peer.authenticated.store(false, Ordering::Relaxed);
+                if let Some(current) = self.peers.get(addr) {
+                    if Arc::ptr_eq(current.value(), &peer) {
+                        drop(current);
+                        self.peers.remove(addr);
+                    }
+                }
                 warn!("{} send to {} failed: {err}", self.tag, peer.addr);
             }
         }

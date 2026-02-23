@@ -10,7 +10,7 @@ The `tcp_tunnel_forward` component actively connects to remote tunnel listeners,
 |---|---|---|---|
 | `type` | Yes | - | Must be `tcp_tunnel_forward`. |
 | `tag` | Yes | - | Unique component identifier. |
-| `forwarders` | Yes | - | Target list, format `ip:port[:count]`. |
+| `forwarders` | Yes | - | Target list, format `host:port[:count]`. |
 | `detour` | No | `[]` | Return traffic targets after decapsulation. |
 | `connection_check_time` | No | `0` | Maintenance interval seconds; runtime enforces minimum `1s`. |
 | `send_timeout` | No | `500ms` | Queue backpressure send wait (`0` is treated as `500ms`). |
@@ -22,9 +22,8 @@ The `tcp_tunnel_forward` component actively connects to remote tunnel listeners,
 ## `forwarders` Format
 
 - `127.0.0.1:5203`: default parallel connection count is `4`
-- `127.0.0.1:5203:8`: parallel connection count is `8`
-
-> Current parsing uses `SocketAddr`, so use directly parsable `IP:PORT` (not domain names).
+- `edge.example.com:5203`: default parallel connection count is `4`
+- `edge.example.com:5203:8`: parallel connection count is `8`
 
 ## Example
 
@@ -47,9 +46,12 @@ The `tcp_tunnel_forward` component actively connects to remote tunnel listeners,
 2. Each new connection sends challenge first; data path starts only after auth.
 3. For each outbound packet, picks one authenticated connection per target pool.
 4. Inbound tunnel payloads are unwrapped and forwarded to `detour`.
-5. Maintenance loop sends heartbeat and replenishes missing connections.
+5. Maintenance has two schedules:
+   - Every `connection_check_time`, it replenishes missing connections.
+   - Every `auth.heartbeat_interval`, it sends heartbeat and retries challenge for unauthenticated connections.
 
 ## Notes
 
 - Component initialization fails if `auth.enabled` is not true.
 - If all connections are unauthenticated, `is_available` is false.
+- Hostname targets are supported. DNS is re-resolved when connections are (re)established.
