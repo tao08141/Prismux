@@ -1,53 +1,61 @@
 # Prismux (Rust Refactor)
 
-## Build
+[English](README.md) | [中文](README_ZH.md)
+
+Prismux is a Rust refactor of UDPlex-style UDP multiplexing and forwarding with modular components.
+
+## Quick Start
+
+Build:
 
 ```bash
 cargo build --release
 ```
 
-## Run
+Run:
 
 ```bash
 ./target/release/prismux -c examples/basic.yaml
 ```
 
-## Docker
+Docker:
 
 ```bash
-docker build -t prismux:local .
-docker run --rm prismux:local
+docker run -d --name prismux --network host \
+  -v $(pwd)/config.yaml:/app/config.yaml \
+  ghcr.io/tao08141/prismux:latest
 ```
 
-Use your own config:
+## Documentation
 
-```bash
-docker run --rm -v "$PWD/examples:/configs" prismux:local -c /configs/basic.yaml
-```
+- [Documentation Index](docs/README_EN.md)
+- [Global Configuration](docs/config_en.md)
+- [Listen Component](docs/listen_en.md)
+- [Forward Component](docs/forward_en.md)
+- [Filter Component](docs/filter_en.md)
+- [Load Balancer Component](docs/load_balancer_en.md)
+- [IP Router Component](docs/ip_router_en.md)
+- [TCP Tunnel Listen Component](docs/tcp_tunnel_listen_en.md)
+- [TCP Tunnel Forward Component](docs/tcp_tunnel_forward_en.md)
+- [Auth Protocol](docs/auth_protocol_en.md)
+- [Protocol Detector](docs/protocol_detector_en.md)
+- [Chinese Documentation](docs/README_ZH.md)
 
-## Integration Metrics (Rust)
+## Metrics
+
+Integration metrics:
 
 ```bash
 cargo test --release --test udp_integration_rust -- --ignored --nocapture
 ```
 
-Metrics output:
+Output:
 
 - `metrics/latest.json`
 - `metrics/<timestamp>.json`
 
-## WSL Comparison (UDPlex Go vs Prismux Rust)
 
-```bash
-bash scripts/run_wsl_bench.sh
-```
-
-Comparison output:
-
-- `metrics/comparison_wsl.json`
-- `metrics/comparison_wsl.md`
-
-## GitHub Actions
+## CI/CD
 
 - `.github/workflows/nightly.yml`: build/test + publish `ghcr.io/<owner>/prismux:dev` and `nightly-<sha>`
 - `.github/workflows/release.yml`: on `v*` tag, publish release asset and Docker tags (`vX.Y.Z`, `vX.Y`, `vX`, `latest`)
