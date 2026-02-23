@@ -37,8 +37,8 @@ run_with_retry "UDPlex benchmark" bash -lc "
 
 echo "[2/4] Running Prismux (Rust) integration benchmarks..."
 run_with_retry "Prismux benchmark" bash -lc "
-  cd \"$ROOT_DIR/tests/integration\"
-  go run udp_integration_rust.go
+  cd \"$ROOT_DIR\"
+  cargo test --release --test udp_integration_rust -- --ignored --nocapture
 "
 
 mkdir -p "$ROOT_DIR/metrics"

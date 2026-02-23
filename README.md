@@ -28,8 +28,7 @@ docker run --rm -v "$PWD/examples:/configs" prismux:local -c /configs/basic.yaml
 ## Integration Metrics (Rust)
 
 ```bash
-cd tests/integration
-go run udp_integration_rust.go
+cargo test --release --test udp_integration_rust -- --ignored --nocapture
 ```
 
 Metrics output:
