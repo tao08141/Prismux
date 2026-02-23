@@ -1,6 +1,7 @@
 use crate::{
     auth::{
-        AuthManager, UnwrappedFrame, MSG_TYPE_AUTH_RESPONSE, MSG_TYPE_HEARTBEAT, MSG_TYPE_HEARTBEAT_ACK,
+        AuthManager, UnwrappedFrame, MSG_TYPE_AUTH_RESPONSE, MSG_TYPE_HEARTBEAT,
+        MSG_TYPE_HEARTBEAT_ACK,
     },
     component::Component,
     config::ComponentConfig,
@@ -38,6 +39,7 @@ struct TunnelForwardConn {
 struct TunnelTarget {
     addr: String,
     desired: usize,
+    pool_id: [u8; 8],
     conns: DashMap<u64, Arc<TunnelForwardConn>>,
     rr: AtomicU64,
 }
@@ -66,16 +68,21 @@ impl TcpTunnelForwardComponent {
         let mut targets = Vec::new();
         for forwarder in cfg.forwarders {
             let (addr, count) = parse_forwarder(&forwarder)?;
+            let mut pool_id = [0u8; 8];
+            rand::thread_rng().fill(&mut pool_id);
             targets.push(Arc::new(TunnelTarget {
                 addr,
                 desired: count,
+                pool_id,
                 conns: DashMap::new(),
                 rr: AtomicU64::new(0),
             }));
         }
 
         if targets.is_empty() {
-            return Err(anyhow!("tcp_tunnel_forward requires at least one forwarder"));
+            return Err(anyhow!(
+                "tcp_tunnel_forward requires at least one forwarder"
+            ));
         }
         let tag = cfg.tag;
         let tag_arc = Arc::<str>::from(tag.as_str());
@@ -98,7 +105,10 @@ impl TcpTunnelForwardComponent {
         while self.running.load(Ordering::Relaxed) {
             for target in &self.targets {
                 while target.conns.len() < target.desired {
-                    if let Err(err) = self.connect_one(Arc::clone(target), Arc::clone(&router)).await {
+                    if let Err(err) = self
+                        .connect_one(Arc::clone(target), Arc::clone(&router))
+                        .await
+                    {
                         debug!("{} connect {} failed: {err}", self.tag, target.addr);
                         break;
                     }
@@ -109,7 +119,7 @@ impl TcpTunnelForwardComponent {
                 for conn in target.conns.iter() {
                     if conn.authenticated.load(Ordering::Relaxed) {
                         let hb = self.auth.create_heartbeat(false);
-                        let _ = conn.tx.send(hb).await;
+                        Self::send_frame(&conn.tx, hb, self.send_timeout).await;
                         *conn.last_heartbeat_sent.write().await = Some(Instant::now());
                     }
                 }
@@ -119,19 +129,21 @@ impl TcpTunnelForwardComponent {
         }
     }
 
-    async fn connect_one(self: &Arc<Self>, target: Arc<TunnelTarget>, router: Arc<Router>) -> Result<()> {
+    async fn connect_one(
+        self: &Arc<Self>,
+        target: Arc<TunnelTarget>,
+        router: Arc<Router>,
+    ) -> Result<()> {
         let stream = TcpStream::connect(&target.addr).await?;
         stream.set_nodelay(true)?;
         let (mut reader, mut writer) = stream.into_split();
 
         let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
-        let mut pool_id = [0u8; 8];
-        rand::thread_rng().fill(&mut pool_id);
 
         let conn = Arc::new(TunnelForwardConn {
             tx,
             authenticated: AtomicBool::new(false),
-            pool_id,
+            pool_id: target.pool_id,
             last_heartbeat_sent: RwLock::new(None),
         });
 
@@ -151,9 +163,13 @@ impl TcpTunnelForwardComponent {
 
         let auth_challenge = self
             .auth
-            .create_auth_challenge(crate::auth::MSG_TYPE_AUTH_CHALLENGE, self.forward_id, pool_id)
+            .create_auth_challenge(
+                crate::auth::MSG_TYPE_AUTH_CHALLENGE,
+                self.forward_id,
+                conn.pool_id,
+            )
             .await?;
-        conn.tx.send(auth_challenge).await?;
+        Self::send_frame(&conn.tx, auth_challenge, self.send_timeout).await;
 
         let this = Arc::clone(self);
         let target_for_reader = Arc::clone(&target);
@@ -176,30 +192,26 @@ impl TcpTunnelForwardComponent {
                             conn_id,
                             proto: None,
                         };
-                        let _ = router
-                            .route_shared(packet, Arc::clone(&this.detour))
-                            .await;
+                        let _ = router.route_shared(packet, Arc::clone(&this.detour)).await;
                     }
-                    Ok(UnwrappedFrame::Control { header, payload }) => {
-                        match header.msg_type {
-                            MSG_TYPE_AUTH_RESPONSE => {
-                                if this.auth.process_auth_challenge(&payload).await.is_ok() {
-                                    conn.authenticated.store(true, Ordering::Relaxed);
-                                }
+                    Ok(UnwrappedFrame::Control { header, payload }) => match header.msg_type {
+                        MSG_TYPE_AUTH_RESPONSE => {
+                            if this.auth.process_auth_challenge(&payload).await.is_ok() {
+                                conn.authenticated.store(true, Ordering::Relaxed);
                             }
-                            MSG_TYPE_HEARTBEAT => {
-                                let hb = this.auth.create_heartbeat(true);
-                                let _ = conn.tx.send(hb).await;
-                            }
-                            MSG_TYPE_HEARTBEAT_ACK => {
-                                let mut lock = conn.last_heartbeat_sent.write().await;
-                                if let Some(ts) = lock.take() {
-                                    this.auth.record_delay(ts.elapsed()).await;
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        MSG_TYPE_HEARTBEAT => {
+                            let hb = this.auth.create_heartbeat(true);
+                            Self::send_frame(&conn.tx, hb, this.send_timeout).await;
+                        }
+                        MSG_TYPE_HEARTBEAT_ACK => {
+                            let mut lock = conn.last_heartbeat_sent.write().await;
+                            if let Some(ts) = lock.take() {
+                                this.auth.record_delay(ts.elapsed()).await;
+                            }
+                        }
+                        _ => {}
+                    },
                     Err(err) => debug!("{} tunnel unwrap error: {err}", this.tag),
                 }
             }
@@ -238,11 +250,11 @@ impl TcpTunnelForwardComponent {
         None
     }
 
-    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes) {
+    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes, send_timeout: Duration) {
         match tx.try_send(frame) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(frame)) => {
-                let _ = tx.send(frame).await;
+                let _ = time::timeout(send_timeout, tx.send(frame)).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
@@ -267,7 +279,7 @@ impl Component for TcpTunnelForwardComponent {
 
         for target in &self.targets {
             if let Some(conn) = self.pick_conn(target) {
-                Self::send_frame(&conn.tx, frame.clone()).await;
+                Self::send_frame(&conn.tx, frame.clone(), self.send_timeout).await;
             }
         }
 

@@ -15,6 +15,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
 use std::{
+    collections::HashSet,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -24,6 +25,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, RwLock},
+    time,
 };
 use tracing::{debug, info};
 
@@ -31,6 +33,8 @@ struct TunnelListenConn {
     tx: mpsc::Sender<Bytes>,
     authenticated: AtomicBool,
     conn_id_hint: AtomicU64,
+    forward_id: AtomicU64,
+    pool_id: AtomicU64,
     last_active: RwLock<Instant>,
     last_heartbeat_sent: RwLock<Option<Instant>>,
 }
@@ -89,6 +93,8 @@ impl TcpTunnelListenComponent {
             tx,
             authenticated: AtomicBool::new(false),
             conn_id_hint: AtomicU64::new(0),
+            forward_id: AtomicU64::new(0),
+            pool_id: AtomicU64::new(0),
             last_active: RwLock::new(Instant::now()),
             last_heartbeat_sent: RwLock::new(None),
         });
@@ -123,42 +129,48 @@ impl TcpTunnelListenComponent {
                         conn_id,
                         proto: None,
                     };
-                    let _ = router
-                        .route_shared(packet, Arc::clone(&self.detour))
-                        .await;
+                    let _ = router.route_shared(packet, Arc::clone(&self.detour)).await;
                 }
-                Ok(UnwrappedFrame::Control { header, payload }) => {
-                    match header.msg_type {
-                        MSG_TYPE_AUTH_CHALLENGE => {
-                            if self.auth.process_auth_challenge(&payload).await.is_ok() {
-                                conn.authenticated.store(true, Ordering::Relaxed);
-                                let mut forward_id = [0u8; 8];
-                                let mut pool_id = [0u8; 8];
-                                rand::thread_rng().fill(&mut forward_id);
-                                rand::thread_rng().fill(&mut pool_id);
-                                if let Ok(resp) = self
-                                    .auth
-                                    .create_auth_challenge(crate::auth::MSG_TYPE_AUTH_RESPONSE, forward_id, pool_id)
-                                    .await
-                                {
-                                    let _ = conn.tx.send(resp).await;
-                                }
+                Ok(UnwrappedFrame::Control { header, payload }) => match header.msg_type {
+                    MSG_TYPE_AUTH_CHALLENGE => {
+                        if let Ok((forward_id, pool_id)) =
+                            self.auth.process_auth_challenge(&payload).await
+                        {
+                            conn.authenticated.store(true, Ordering::Relaxed);
+                            conn.forward_id
+                                .store(u64::from_be_bytes(forward_id), Ordering::Relaxed);
+                            conn.pool_id
+                                .store(u64::from_be_bytes(pool_id), Ordering::Relaxed);
+                            let mut forward_id = [0u8; 8];
+                            let mut pool_id = [0u8; 8];
+                            rand::thread_rng().fill(&mut forward_id);
+                            rand::thread_rng().fill(&mut pool_id);
+                            if let Ok(resp) = self
+                                .auth
+                                .create_auth_challenge(
+                                    crate::auth::MSG_TYPE_AUTH_RESPONSE,
+                                    forward_id,
+                                    pool_id,
+                                )
+                                .await
+                            {
+                                Self::send_frame(&conn.tx, resp, self.send_timeout).await;
                             }
                         }
-                        MSG_TYPE_HEARTBEAT => {
-                            let hb = self.auth.create_heartbeat(true);
-                            let _ = conn.tx.send(hb).await;
-                            *conn.last_active.write().await = Instant::now();
-                        }
-                        MSG_TYPE_HEARTBEAT_ACK => {
-                            let mut lock = conn.last_heartbeat_sent.write().await;
-                            if let Some(ts) = lock.take() {
-                                self.auth.record_delay(ts.elapsed()).await;
-                            }
-                        }
-                        _ => {}
                     }
-                }
+                    MSG_TYPE_HEARTBEAT => {
+                        let hb = self.auth.create_heartbeat(true);
+                        Self::send_frame(&conn.tx, hb, self.send_timeout).await;
+                        *conn.last_active.write().await = Instant::now();
+                    }
+                    MSG_TYPE_HEARTBEAT_ACK => {
+                        let mut lock = conn.last_heartbeat_sent.write().await;
+                        if let Some(ts) = lock.take() {
+                            self.auth.record_delay(ts.elapsed()).await;
+                        }
+                    }
+                    _ => {}
+                },
                 Err(err) => {
                     debug!("{} tcp unwrap error: {err}", self.tag);
                 }
@@ -169,11 +181,11 @@ impl TcpTunnelListenComponent {
         write_task.abort();
     }
 
-    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes) {
+    async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes, send_timeout: Duration) {
         match tx.try_send(frame) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(frame)) => {
-                let _ = tx.send(frame).await;
+                let _ = time::timeout(send_timeout, tx.send(frame)).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
@@ -198,11 +210,23 @@ impl Component for TcpTunnelListenComponent {
         let frame = self.auth.wrap_data(packet.conn_id, &packet.data)?;
 
         if self.broadcast_mode {
+            let mut selected = HashSet::new();
             for conn in self.conns.iter() {
                 if !conn.authenticated.load(Ordering::Relaxed) {
                     continue;
                 }
-                Self::send_frame(&conn.tx, frame.clone()).await;
+
+                let key = (
+                    conn.forward_id.load(Ordering::Relaxed),
+                    conn.pool_id.load(Ordering::Relaxed),
+                );
+
+                // Keep one active TCP stream per tunnel pool, avoiding duplicate fan-out
+                // and reducing write-side queue pressure.
+                if key != (0, 0) && !selected.insert(key) {
+                    continue;
+                }
+                Self::send_frame(&conn.tx, frame.clone(), self.send_timeout).await;
             }
         } else {
             let target = self
@@ -212,7 +236,7 @@ impl Component for TcpTunnelListenComponent {
                 .map(|e| e.key().to_owned());
             if let Some(id) = target {
                 if let Some(conn) = self.conns.get(&id) {
-                    Self::send_frame(&conn.tx, frame).await;
+                    Self::send_frame(&conn.tx, frame, self.send_timeout).await;
                 }
             }
         }
