@@ -12,6 +12,19 @@ cargo build --release
 ./target/release/prismux -c examples/basic.yaml
 ```
 
+## Docker
+
+```bash
+docker build -t prismux:local .
+docker run --rm prismux:local
+```
+
+Use your own config:
+
+```bash
+docker run --rm -v "$PWD/examples:/configs" prismux:local -c /configs/basic.yaml
+```
+
 ## Integration Metrics (Rust)
 
 ```bash
@@ -34,3 +47,8 @@ Comparison output:
 
 - `metrics/comparison_wsl.json`
 - `metrics/comparison_wsl.md`
+
+## GitHub Actions
+
+- `.github/workflows/nightly.yml`: build/test + publish `ghcr.io/<owner>/prismux:dev` and `nightly-<sha>`
+- `.github/workflows/release.yml`: on `v*` tag, publish release asset and Docker tags (`vX.Y.Z`, `vX.Y`, `vX`, `latest`)
