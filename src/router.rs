@@ -58,6 +58,10 @@ impl Router {
         self.components.get(tag).map(|v| Arc::clone(v.value()))
     }
 
+    pub fn has_component(&self, tag: &str) -> bool {
+        self.components.contains_key(tag)
+    }
+
     pub fn all_component_tags(&self) -> Vec<String> {
         self.components.iter().map(|v| v.key().clone()).collect()
     }

@@ -15,7 +15,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use rand::Rng;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -65,7 +65,11 @@ impl TcpTunnelListenComponent {
             listen_addr: cfg.listen_addr,
             detour: Arc::<[String]>::from(cfg.detour),
             auth,
-            send_timeout: Duration::from_millis(cfg.send_timeout.max(1)),
+            send_timeout: Duration::from_millis(if cfg.send_timeout == 0 {
+                500
+            } else {
+                cfg.send_timeout
+            }),
             broadcast_mode: cfg.broadcast_mode.unwrap_or(true),
             running: AtomicBool::new(false),
             conns: DashMap::new(),
@@ -87,7 +91,8 @@ impl TcpTunnelListenComponent {
 
     async fn handle_stream(self: Arc<Self>, router: Arc<Router>, id: u64, stream: TcpStream) {
         let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
+        let queue_cap = router.config.queue_size.max(16384).min(131072);
+        let (tx, mut rx) = mpsc::channel::<Bytes>(queue_cap);
 
         let conn = Arc::new(TunnelListenConn {
             tx,
@@ -210,7 +215,7 @@ impl Component for TcpTunnelListenComponent {
         let frame = self.auth.wrap_data(packet.conn_id, &packet.data)?;
 
         if self.broadcast_mode {
-            let mut selected = HashSet::new();
+            let mut best_by_pool: HashMap<(u64, u64), (usize, Arc<TunnelListenConn>)> = HashMap::new();
             for conn in self.conns.iter() {
                 if !conn.authenticated.load(Ordering::Relaxed) {
                     continue;
@@ -221,11 +226,21 @@ impl Component for TcpTunnelListenComponent {
                     conn.pool_id.load(Ordering::Relaxed),
                 );
 
-                // Keep one active TCP stream per tunnel pool, avoiding duplicate fan-out
-                // and reducing write-side queue pressure.
-                if key != (0, 0) && !selected.insert(key) {
+                if key == (0, 0) {
+                    Self::send_frame(&conn.tx, frame.clone(), self.send_timeout).await;
                     continue;
                 }
+
+                let cap = conn.tx.capacity();
+                match best_by_pool.get(&key) {
+                    Some((best_cap, _)) if *best_cap >= cap => {}
+                    _ => {
+                        best_by_pool.insert(key, (cap, Arc::clone(conn.value())));
+                    }
+                }
+            }
+
+            for (_, (_, conn)) in best_by_pool {
                 Self::send_frame(&conn.tx, frame.clone(), self.send_timeout).await;
             }
         } else {

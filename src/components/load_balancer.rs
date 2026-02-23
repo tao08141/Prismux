@@ -6,13 +6,14 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use evalexpr::{build_operator_tree, ContextWithMutableVariables, HashMapContext, Node, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::Mutex,
@@ -37,6 +38,7 @@ struct CompiledRule {
     targets: Arc<[String]>,
     available_tags: Vec<String>,
     delay_tags: Vec<String>,
+    uses_traffic_stats: bool,
 }
 
 enum RuleExec {
@@ -45,6 +47,11 @@ enum RuleExec {
 }
 
 enum FastRule {
+    SeqMaskEq {
+        mask: u64,
+        equals: u64,
+        available_tag: Option<String>,
+    },
     SeqModEq {
         modulo: u64,
         equals: u64,
@@ -59,15 +66,26 @@ enum FastRule {
     },
 }
 
+#[derive(Clone, Copy)]
+struct DelaySample {
+    value_ms: f64,
+    updated_at: Instant,
+}
+
 pub struct LoadBalancerComponent {
     tag: String,
     rules: Vec<CompiledRule>,
     miss: Arc<[String]>,
     packet_seq: AtomicU64,
+    enable_traffic_stats: bool,
     current_bytes: AtomicU64,
     current_packets: AtomicU64,
+    avg_bps: AtomicU64,
+    avg_pps: AtomicU64,
     running: AtomicBool,
     stats: Arc<Mutex<TrafficStats>>,
+    delay_cache: DashMap<String, DelaySample>,
+    delay_cache_ttl: Duration,
     sample_interval: Duration,
 }
 
@@ -77,6 +95,7 @@ impl LoadBalancerComponent {
         for rule in cfg.detour {
             rules.push(Self::compile_rule(rule)?);
         }
+        let enable_traffic_stats = rules.iter().any(|r| r.uses_traffic_stats);
 
         let window_size = cfg.window_size.max(1) as usize;
 
@@ -85,8 +104,11 @@ impl LoadBalancerComponent {
             rules,
             miss: Arc::<[String]>::from(cfg.miss),
             packet_seq: AtomicU64::new(0),
+            enable_traffic_stats,
             current_bytes: AtomicU64::new(0),
             current_packets: AtomicU64::new(0),
+            avg_bps: AtomicU64::new(0),
+            avg_pps: AtomicU64::new(0),
             running: AtomicBool::new(false),
             stats: Arc::new(Mutex::new(TrafficStats {
                 samples: vec![TrafficSample::default(); window_size],
@@ -94,6 +116,8 @@ impl LoadBalancerComponent {
                 total_bytes: 0,
                 total_packets: 0,
             })),
+            delay_cache: DashMap::new(),
+            delay_cache_ttl: Duration::from_millis(200),
             sample_interval: Duration::from_secs(1),
         }))
     }
@@ -101,6 +125,7 @@ impl LoadBalancerComponent {
     fn compile_rule(rule: LoadBalancerDetourRule) -> Result<CompiledRule> {
         let available_tags = extract_tag_vars(&rule.rule, "available_");
         let delay_tags = extract_tag_vars(&rule.rule, "delay_");
+        let uses_traffic_stats = has_identifier(&rule.rule, "bps") || has_identifier(&rule.rule, "pps");
         let exec = if let Some(fast) = parse_fast_rule(&rule.rule) {
             RuleExec::Fast(fast)
         } else {
@@ -111,6 +136,7 @@ impl LoadBalancerComponent {
             targets: Arc::<[String]>::from(rule.targets),
             available_tags,
             delay_tags,
+            uses_traffic_stats,
         })
     }
 
@@ -140,17 +166,45 @@ impl LoadBalancerComponent {
             };
 
             stats.idx = (stats.idx + 1) % stats.samples.len();
+
+            let sample_count = stats.samples.len() as u64 + 1;
+            let bytes = stats.total_bytes + current_bytes;
+            let packets = stats.total_packets + current_packets;
+            self.avg_bps
+                .store((bytes * 8) / sample_count.max(1), Ordering::Relaxed);
+            self.avg_pps
+                .store(packets / sample_count.max(1), Ordering::Relaxed);
         }
     }
 
-    async fn current_bps_pps(&self) -> (u64, u64) {
-        let current_bytes = self.current_bytes.load(Ordering::Relaxed);
-        let current_packets = self.current_packets.load(Ordering::Relaxed);
-        let stats = self.stats.lock().await;
-        let sample_count = stats.samples.len() as u64 + 1;
-        let bytes = stats.total_bytes + current_bytes;
-        let packets = stats.total_packets + current_packets;
-        ((bytes * 8) / sample_count.max(1), packets / sample_count.max(1))
+    fn current_bps_pps(&self) -> (u64, u64) {
+        (
+            self.avg_bps.load(Ordering::Relaxed),
+            self.avg_pps.load(Ordering::Relaxed),
+        )
+    }
+
+    async fn delay_ms_for(&self, router: &Router, tag: &str) -> f64 {
+        let now = Instant::now();
+        if let Some(v) = self.delay_cache.get(tag) {
+            if now.duration_since(v.updated_at) <= self.delay_cache_ttl {
+                return v.value_ms;
+            }
+        }
+
+        let delay = if let Some(comp) = router.get_component(tag) {
+            comp.average_delay_ms().await
+        } else {
+            f64::MAX
+        };
+        self.delay_cache.insert(
+            tag.to_string(),
+            DelaySample {
+                value_ms: delay,
+                updated_at: now,
+            },
+        );
+        delay
     }
 
     async fn evaluate_targets(
@@ -164,7 +218,39 @@ impl LoadBalancerComponent {
         let mut selected = Vec::new();
         for rule in &self.rules {
             if let RuleExec::Fast(fast) = &rule.exec {
-                if fast_rule_matches(fast, router, seq).await {
+                let matched = match fast {
+                    FastRule::SeqMaskEq {
+                        mask,
+                        equals,
+                        available_tag,
+                    } => {
+                        if (seq & *mask) != *equals {
+                            false
+                        } else if let Some(tag) = available_tag {
+                            router.has_component(tag)
+                        } else {
+                            true
+                        }
+                    }
+                    FastRule::SeqModEq {
+                        modulo,
+                        equals,
+                        available_tag,
+                    } => {
+                        if seq % *modulo != *equals {
+                            false
+                        } else if let Some(tag) = available_tag {
+                            router.has_component(tag)
+                        } else {
+                            true
+                        }
+                    }
+                    FastRule::DelayLt { tag, threshold } => {
+                        self.delay_ms_for(router, tag).await < *threshold
+                    }
+                    FastRule::Available { tag } => router.has_component(tag),
+                };
+                if matched {
                     selected.push(Arc::clone(&rule.targets));
                 }
                 continue;
@@ -177,16 +263,12 @@ impl LoadBalancerComponent {
             let _ = ctx.set_value("pps".into(), Value::Int(pps as i64));
 
             for tag in &rule.available_tags {
-                let available = router.get_component(tag).is_some();
+                let available = router.has_component(tag);
                 let _ = ctx.set_value(format!("available_{tag}").into(), Value::Boolean(available));
             }
 
             for tag in &rule.delay_tags {
-                let delay = if let Some(comp) = router.get_component(tag) {
-                    comp.average_delay_ms().await
-                } else {
-                    f64::MAX
-                };
+                let delay = self.delay_ms_for(router, tag).await;
                 let _ = ctx.set_value(format!("delay_{tag}").into(), Value::Float(delay));
             }
 
@@ -218,16 +300,24 @@ impl Component for LoadBalancerComponent {
 
     async fn start(self: Arc<Self>, _router: Arc<Router>) -> Result<()> {
         self.running.store(true, Ordering::Relaxed);
-        tokio::spawn(Arc::clone(&self).sampler());
+        if self.enable_traffic_stats {
+            tokio::spawn(Arc::clone(&self).sampler());
+        }
         Ok(())
     }
 
     async fn handle_packet(&self, router: &Router, packet: Packet) -> Result<()> {
-        self.current_packets.fetch_add(1, Ordering::Relaxed);
-        self.current_bytes
-            .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
+        if self.enable_traffic_stats {
+            self.current_packets.fetch_add(1, Ordering::Relaxed);
+            self.current_bytes
+                .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
+        }
 
-        let (bps, pps) = self.current_bps_pps().await;
+        let (bps, pps) = if self.enable_traffic_stats {
+            self.current_bps_pps()
+        } else {
+            (0, 0)
+        };
         let seq = self.packet_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let size = packet.data.len() as u64;
 
@@ -273,36 +363,29 @@ fn extract_tag_vars(expr: &str, prefix: &str) -> Vec<String> {
     out
 }
 
+fn has_identifier(expr: &str, identifier: &str) -> bool {
+    expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|token| token == identifier)
+}
+
 fn parse_fast_rule(expr: &str) -> Option<FastRule> {
     let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
 
     if let Some((left, right)) = compact.split_once("&&") {
         if let Some(tag) = left.strip_prefix("available_") {
             if let Some((modulo, equals)) = parse_seq_mod_eq(right) {
-                return Some(FastRule::SeqModEq {
-                    modulo,
-                    equals,
-                    available_tag: Some(tag.to_string()),
-                });
+                return Some(seq_rule_for(modulo, equals, Some(tag.to_string())));
             }
         }
         if let Some(tag) = right.strip_prefix("available_") {
             if let Some((modulo, equals)) = parse_seq_mod_eq(left) {
-                return Some(FastRule::SeqModEq {
-                    modulo,
-                    equals,
-                    available_tag: Some(tag.to_string()),
-                });
+                return Some(seq_rule_for(modulo, equals, Some(tag.to_string())));
             }
         }
     }
 
     if let Some((modulo, equals)) = parse_seq_mod_eq(&compact) {
-        return Some(FastRule::SeqModEq {
-            modulo,
-            equals,
-            available_tag: None,
-        });
+        return Some(seq_rule_for(modulo, equals, None));
     }
 
     if let Some(tag) = compact.strip_prefix("available_") {
@@ -325,6 +408,22 @@ fn parse_fast_rule(expr: &str) -> Option<FastRule> {
     None
 }
 
+fn seq_rule_for(modulo: u64, equals: u64, available_tag: Option<String>) -> FastRule {
+    if modulo.is_power_of_two() {
+        FastRule::SeqMaskEq {
+            mask: modulo - 1,
+            equals,
+            available_tag,
+        }
+    } else {
+        FastRule::SeqModEq {
+            modulo,
+            equals,
+            available_tag,
+        }
+    }
+}
+
 fn parse_seq_mod_eq(expr: &str) -> Option<(u64, u64)> {
     let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
     if !compact.starts_with("seq%") {
@@ -340,27 +439,3 @@ fn parse_seq_mod_eq(expr: &str) -> Option<(u64, u64)> {
     Some((modulo, equals))
 }
 
-async fn fast_rule_matches(rule: &FastRule, router: &Router, seq: u64) -> bool {
-    match rule {
-        FastRule::SeqModEq {
-            modulo,
-            equals,
-            available_tag,
-        } => {
-            if seq % *modulo != *equals {
-                return false;
-            }
-            if let Some(tag) = available_tag {
-                return router.get_component(tag).is_some();
-            }
-            true
-        }
-        FastRule::DelayLt { tag, threshold } => {
-            let Some(comp) = router.get_component(tag) else {
-                return false;
-            };
-            comp.average_delay_ms().await < *threshold
-        }
-        FastRule::Available { tag } => router.get_component(tag).is_some(),
-    }
-}

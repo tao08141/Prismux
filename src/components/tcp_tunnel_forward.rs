@@ -95,7 +95,11 @@ impl TcpTunnelForwardComponent {
             targets,
             forward_id,
             check_interval: Duration::from_secs(cfg.connection_check_time.max(1)),
-            send_timeout: Duration::from_millis(cfg.send_timeout.max(1)),
+            send_timeout: Duration::from_millis(if cfg.send_timeout == 0 {
+                500
+            } else {
+                cfg.send_timeout
+            }),
             running: AtomicBool::new(false),
             next_conn_id: AtomicU64::new(1),
         }))
@@ -138,7 +142,8 @@ impl TcpTunnelForwardComponent {
         stream.set_nodelay(true)?;
         let (mut reader, mut writer) = stream.into_split();
 
-        let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
+        let queue_cap = router.config.queue_size.max(16384).min(131072);
+        let (tx, mut rx) = mpsc::channel::<Bytes>(queue_cap);
 
         let conn = Arc::new(TunnelForwardConn {
             tx,
@@ -223,31 +228,19 @@ impl TcpTunnelForwardComponent {
     }
 
     fn pick_conn(&self, target: &TunnelTarget) -> Option<Arc<TunnelForwardConn>> {
-        let len = target.conns.len();
-        if len == 0 {
-            return None;
-        }
-        let start = (target.rr.fetch_add(1, Ordering::Relaxed) as usize) % len;
-
-        let mut idx = 0usize;
+        let _ = target.rr.fetch_add(1, Ordering::Relaxed);
+        let mut best: Option<(usize, Arc<TunnelForwardConn>)> = None;
         for entry in target.conns.iter() {
-            if idx >= start && entry.authenticated.load(Ordering::Relaxed) {
-                return Some(Arc::clone(entry.value()));
+            if !entry.authenticated.load(Ordering::Relaxed) {
+                continue;
             }
-            idx = idx.saturating_add(1);
+            let cap = entry.tx.capacity();
+            match &best {
+                Some((best_cap, _)) if *best_cap >= cap => {}
+                _ => best = Some((cap, Arc::clone(entry.value()))),
+            }
         }
-
-        idx = 0;
-        for entry in target.conns.iter() {
-            if idx >= start {
-                break;
-            }
-            if entry.authenticated.load(Ordering::Relaxed) {
-                return Some(Arc::clone(entry.value()));
-            }
-            idx = idx.saturating_add(1);
-        }
-        None
+        best.map(|(_, conn)| conn)
     }
 
     async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes, send_timeout: Duration) {

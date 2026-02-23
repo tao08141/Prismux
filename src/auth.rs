@@ -117,22 +117,20 @@ impl AuthManager {
             cleanup_challenge_cache(&mut cache, self.auth_timeout);
         }
 
-        let ts = now_millis();
-        let mut data = Vec::with_capacity(HANDSHAKE_SIZE);
-        data.extend_from_slice(&challenge);
-        data.extend_from_slice(&forward_id);
-        data.extend_from_slice(&pool_id);
-        data.extend_from_slice(&ts.to_be_bytes());
+        let mut out = BytesMut::with_capacity(HEADER_SIZE + HANDSHAKE_SIZE);
+        write_header(&mut out, msg_type, HANDSHAKE_SIZE as u32);
+        let payload_start = out.len();
+
+        out.extend_from_slice(&challenge);
+        out.extend_from_slice(&forward_id);
+        out.extend_from_slice(&pool_id);
+        out.extend_from_slice(&now_millis().to_be_bytes());
 
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.secret.as_slice())
             .context("failed to create hmac")?;
-        mac.update(&data);
+        mac.update(&out[payload_start..]);
         let mac_bytes = mac.finalize().into_bytes();
-        data.extend_from_slice(&mac_bytes);
-
-        let mut out = BytesMut::with_capacity(HEADER_SIZE + data.len());
-        write_header(&mut out, msg_type, data.len() as u32);
-        out.extend_from_slice(&data);
+        out.extend_from_slice(&mac_bytes);
         Ok(out.freeze())
     }
 
@@ -193,24 +191,24 @@ impl AuthManager {
             let ctr = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
             nonce_bytes[4..].copy_from_slice(&ctr.to_be_bytes());
 
-            let ts = now_millis();
-            let mut ciphertext = Vec::with_capacity(TIMESTAMP_SIZE + CONN_ID_SIZE + payload.len());
-            ciphertext.extend_from_slice(&ts.to_be_bytes());
-            ciphertext.extend_from_slice(&conn_id.to_be_bytes());
-            ciphertext.extend_from_slice(payload);
+            let plaintext_len = TIMESTAMP_SIZE + CONN_ID_SIZE + payload.len();
+            let frame_body_len = NONCE_SIZE + plaintext_len + 16;
+            let mut out = BytesMut::with_capacity(HEADER_SIZE + frame_body_len);
+            write_header(&mut out, MSG_TYPE_DATA, frame_body_len as u32);
+            out.extend_from_slice(&nonce_bytes);
+
+            let encrypted_start = out.len();
+            out.extend_from_slice(&now_millis().to_be_bytes());
+            out.extend_from_slice(&conn_id.to_be_bytes());
+            out.extend_from_slice(payload);
 
             let tag = cipher
-                .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), b"", &mut ciphertext)
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&nonce_bytes),
+                    b"",
+                    &mut out[encrypted_start..],
+                )
                 .map_err(|_| anyhow!("encrypt failed"))?;
-
-            let mut out = BytesMut::with_capacity(HEADER_SIZE + NONCE_SIZE + ciphertext.len() + tag.len());
-            write_header(
-                &mut out,
-                MSG_TYPE_DATA,
-                (NONCE_SIZE + ciphertext.len() + tag.len()) as u32,
-            );
-            out.extend_from_slice(&nonce_bytes);
-            out.extend_from_slice(&ciphertext);
             out.extend_from_slice(tag.as_slice());
             Ok(out.freeze())
         } else {
