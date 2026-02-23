@@ -474,11 +474,17 @@
             if (comp.detour) {
                 if (Array.isArray(comp.detour)) {
                     comp.detour.forEach(t => {
-                        if (typeof t === 'object' && t !== null && t.tag) targets.push(t.tag);
+                        if (typeof t === 'object' && t !== null) {
+                            if (t.tag) targets.push(t.tag);
+                            if (t.targets && Array.isArray(t.targets)) targets.push(...t.targets);
+                        }
                         else if (typeof t === 'string') targets.push(t);
                     });
                 } else {
-                    if (typeof comp.detour === 'object' && comp.detour !== null && comp.detour.tag) targets.push(comp.detour.tag);
+                    if (typeof comp.detour === 'object' && comp.detour !== null) {
+                        if (comp.detour.tag) targets.push(comp.detour.tag);
+                        if (comp.detour.targets && Array.isArray(comp.detour.targets)) targets.push(...comp.detour.targets);
+                    }
                     else if (typeof comp.detour === 'string') targets.push(comp.detour);
                 }
             }
@@ -586,27 +592,46 @@
                     detailsHtml += `<p><span class="param-key">每秒包数:</span> ${comp.packets_per_sec}</p>`;
                 }
 
-                // 出口显示处理（支持 load_balancer 的权重对象）
-                let displayRoutes = [];
+                // 出口显示处理（支持 load_balancer 的权重和规则路由对象）
                 if (comp.detour) {
+                    detailsHtml += `<div style="margin-top: 0.5rem;"><span class="param-key">出口:</span>`;
+                    detailsHtml += `<div class="pools-container" style="border-top: none; padding-top: 0; margin-top: 0.25rem;">`;
+
+                    const renderDetourItem = (d) => {
+                        if (typeof d === 'string') {
+                            return `<div class="pool-item" style="display: flex; justify-content: space-between;">
+                                <span>目标:</span> <span style="color: var(--highlight-border)">${d}</span>
+                            </div>`;
+                        } else if (typeof d === 'object' && d !== null) {
+                            if (d.rule && d.targets) {
+                                return `<div class="pool-item">
+                                    <div class="pool-header" style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; color: #cbd5e1; margin-bottom: 0.25rem;">
+                                        🕒 [规则] ${d.rule}
+                                    </div>
+                                    <div style="color: var(--highlight-border); padding-left: 0.25rem; border-left: 2px solid rgba(255, 255, 255, 0.1); margin-top: 0.2rem;">
+                                        ${d.targets.join(', ')}
+                                    </div>
+                                </div>`;
+                            } else if (d.tag) {
+                                return `<div class="pool-item" style="display: flex; justify-content: space-between;">
+                                    <span>目标:</span> <span style="color: var(--highlight-border)">${d.tag} ${d.weight ? `(w:${d.weight})` : ''}</span>
+                                </div>`;
+                            } else {
+                                return `<div class="pool-item" style="word-break: break-all;">${JSON.stringify(d)}</div>`;
+                            }
+                        }
+                        return '';
+                    };
+
                     if (Array.isArray(comp.detour)) {
                         comp.detour.forEach(d => {
-                            if (typeof d === 'string') displayRoutes.push(d);
-                            else if (typeof d === 'object' && d !== null && d.tag) {
-                                displayRoutes.push(`${d.tag}${d.weight ? ` (w:${d.weight})` : ''}`);
-                            } else {
-                                displayRoutes.push(JSON.stringify(d));
-                            }
+                            detailsHtml += renderDetourItem(d);
                         });
-                    } else if (typeof comp.detour === 'string') {
-                        displayRoutes.push(comp.detour);
-                    } else if (typeof comp.detour === 'object' && comp.detour !== null && comp.detour.tag) {
-                        displayRoutes.push(`${comp.detour.tag}${comp.detour.weight ? ` (w:${comp.detour.weight})` : ''}`);
+                    } else {
+                        detailsHtml += renderDetourItem(comp.detour);
                     }
-                }
 
-                if (displayRoutes.length > 0) {
-                    detailsHtml += `<p><span class="param-key">出口:</span> <span style="color: var(--highlight-border)">${displayRoutes.join(', ')}</span></p>`;
+                    detailsHtml += `</div></div>`;
                 }
 
                 if (comp.detour_miss) {
