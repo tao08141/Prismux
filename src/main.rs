@@ -22,6 +22,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -36,11 +37,27 @@ struct Cli {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    if let Err(err) = run().await {
+        error!("Prismux fatal error: {err:#}");
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+    let mut exit_guard = ExitGuard::new();
 
     init_logger(&config);
     install_panic_hook();
+    let pid = std::process::id();
+    info!(
+        "Prismux process started pid={} version={} marker={}",
+        pid,
+        env!("CARGO_PKG_VERSION"),
+        "diag-v2-2026-02-24"
+    );
     info!("Prismux booting with config {}", cli.config.display());
 
     let router = Router::new(config.clone());
@@ -62,6 +79,8 @@ async fn main() -> Result<()> {
 
     info!("UDPlex started and ready");
 
+    let diag_task = maybe_start_diag_heartbeat();
+
     let signal = wait_for_shutdown_signal().await?;
     info!("Shutdown signal received: {signal}");
 
@@ -71,7 +90,11 @@ async fn main() -> Result<()> {
         info!("API server stopped");
     }
     router.shutdown();
+    if let Some(task) = diag_task {
+        task.abort();
+    }
     info!("Router shutdown notified, Prismux exiting");
+    exit_guard.disarm("graceful-signal-shutdown");
     Ok(())
 }
 
@@ -117,16 +140,109 @@ fn install_panic_hook() {
     }));
 }
 
+struct ExitGuard {
+    reason: Option<&'static str>,
+}
+
+impl ExitGuard {
+    fn new() -> Self {
+        Self { reason: None }
+    }
+
+    fn disarm(&mut self, reason: &'static str) {
+        self.reason = Some(reason);
+    }
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if let Some(reason) = self.reason {
+            info!("Prismux run loop exit reason={reason}");
+        } else {
+            error!("Prismux run loop exited without graceful shutdown marker");
+        }
+    }
+}
+
+fn maybe_start_diag_heartbeat() -> Option<tokio::task::JoinHandle<()>> {
+    let raw = std::env::var("PRISMUX_DIAG_INTERVAL_SEC").ok()?;
+    let sec = raw.parse::<u64>().ok()?;
+    if sec == 0 {
+        return None;
+    }
+
+    let interval = Duration::from_secs(sec);
+    info!(
+        "Diagnostics heartbeat enabled interval={}s (env PRISMUX_DIAG_INTERVAL_SEC)",
+        sec
+    );
+    Some(tokio::spawn(async move {
+        diag_heartbeat_loop(interval).await;
+    }))
+}
+
+async fn diag_heartbeat_loop(interval: Duration) {
+    use tokio::time::{self, MissedTickBehavior};
+
+    let started = Instant::now();
+    let pid = std::process::id();
+    let mut ticker = time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let uptime_s = started.elapsed().as_secs();
+        #[cfg(target_os = "linux")]
+        {
+            if let Some((rss_kb, threads)) = read_linux_proc_status() {
+                info!(
+                    "diag heartbeat pid={} uptime_s={} rss_kb={} threads={}",
+                    pid, uptime_s, rss_kb, threads
+                );
+                continue;
+            }
+        }
+        info!("diag heartbeat pid={} uptime_s={}", pid, uptime_s);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_proc_status() -> Option<(u64, u64)> {
+    let content = fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_kb = None;
+    let mut threads = None;
+
+    for line in content.lines() {
+        if line.starts_with("VmRSS:") {
+            rss_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
+        } else if line.starts_with("Threads:") {
+            threads = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+
+    Some((rss_kb.unwrap_or(0), threads.unwrap_or(0)))
+}
+
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("failed to install SIGHUP handler")?;
+    let mut sigquit = signal(SignalKind::quit()).context("failed to install SIGQUIT handler")?;
 
     tokio::select! {
         _ = sigint.recv() => Ok("SIGINT"),
         _ = sigterm.recv() => Ok("SIGTERM"),
+        _ = sighup.recv() => Ok("SIGHUP"),
+        _ = sigquit.recv() => Ok("SIGQUIT"),
     }
 }
 
