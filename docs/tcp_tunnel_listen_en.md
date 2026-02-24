@@ -11,6 +11,7 @@ The `tcp_tunnel_listen` component accepts TCP tunnel connections, decapsulates U
 | `type` | Yes | - | Must be `tcp_tunnel_listen`. |
 | `tag` | Yes | - | Unique component identifier. |
 | `listen_addr` | Yes | - | TCP bind address. |
+| `timeout` | No | `30s` | Connection idle timeout; unauthenticated connections are also dropped after auth timeout. |
 | `detour` | No | `[]` | Forward targets for decapsulated traffic. |
 | `broadcast_mode` | No | `true` | Whether outbound frames broadcast by pool. |
 | `send_timeout` | No | `500ms` | Queue backpressure send wait (`0` is treated as `500ms`). |
@@ -39,7 +40,10 @@ The `tcp_tunnel_listen` component accepts TCP tunnel connections, decapsulates U
 2. Frames are authenticated and unwrapped:
    - DATA: accepted only after auth succeeds, then forwarded to `detour`.
    - Control frames: challenge/heartbeat/ack are handled internally.
-3. Outbound traffic is wrapped and sent:
+3. Connections are removed automatically:
+   - unauthenticated connections are closed after auth timeout;
+   - authenticated connections are closed after `timeout` of inactivity.
+4. Outbound traffic is wrapped and sent:
    - `broadcast_mode=true`: group by `(forward_id, pool_id)`, pick best-capacity connection per group.
    - `broadcast_mode=false`: route by `conn_id_hint`.
 

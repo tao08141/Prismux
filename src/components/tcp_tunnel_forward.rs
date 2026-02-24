@@ -29,7 +29,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     time::{self, MissedTickBehavior},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 struct TunnelForwardConn {
     tx: mpsc::Sender<Bytes>,
@@ -131,12 +131,25 @@ impl TcpTunnelForwardComponent {
                 _ = check_ticker.tick() => {
                     for target in &self.targets {
                         while target.conns.len() < target.desired {
+                            let next_index = target.conns.len() + 1;
+                            info!(
+                                "{} reconnect {} attempt {}/{}",
+                                self.tag, target.addr, next_index, target.desired
+                            );
                             if let Err(err) = self
                                 .connect_one(Arc::clone(target), Arc::clone(&router))
                                 .await
                             {
-                                debug!("{} connect {} failed: {err}", self.tag, target.addr);
+                                warn!("{} reconnect {} failed: {err}", self.tag, target.addr);
                                 break;
+                            } else {
+                                info!(
+                                    "{} reconnect {} succeeded ({}/{})",
+                                    self.tag,
+                                    target.addr,
+                                    target.conns.len(),
+                                    target.desired
+                                );
                             }
                         }
                     }
@@ -176,6 +189,7 @@ impl TcpTunnelForwardComponent {
         target: Arc<TunnelTarget>,
         router: Arc<Router>,
     ) -> Result<()> {
+        debug!("{} dialing tcp tunnel {}", self.tag, target.addr);
         let stream = TcpStream::connect(&target.addr).await?;
         let std_stream = stream.into_std()?;
         std_stream.set_nonblocking(true)?;
@@ -205,13 +219,24 @@ impl TcpTunnelForwardComponent {
 
         let target_for_writer = Arc::clone(&target);
         let writer_conn_id = conn_id;
+        let writer_tag = self.tag.clone();
+        let writer_remote = target.addr.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                if write_frame(&mut writer, &frame).await.is_err() {
+                if let Err(err) = write_frame(&mut writer, &frame).await {
+                    warn!(
+                        "{} tcp_tunnel writer {} #{} closed: {err}",
+                        writer_tag, writer_remote, writer_conn_id
+                    );
                     break;
                 }
             }
-            target_for_writer.conns.remove(&writer_conn_id);
+            if target_for_writer.conns.remove(&writer_conn_id).is_some() {
+                info!(
+                    "{} tcp_tunnel {} #{} removed, waiting reconnect",
+                    writer_tag, writer_remote, writer_conn_id
+                );
+            }
         });
 
         let auth_challenge = self
@@ -229,7 +254,11 @@ impl TcpTunnelForwardComponent {
         tokio::spawn(async move {
             let mut frame_buf = BytesMut::with_capacity(2048);
             loop {
-                if read_frame_into(&mut reader, &mut frame_buf).await.is_err() {
+                if let Err(err) = read_frame_into(&mut reader, &mut frame_buf).await {
+                    warn!(
+                        "{} tcp_tunnel reader {} #{} closed: {err}",
+                        this.tag, conn.remote_addr, conn_id
+                    );
                     break;
                 }
 
@@ -252,12 +281,18 @@ impl TcpTunnelForwardComponent {
                         MSG_TYPE_AUTH_RESPONSE => {
                             if this.auth.process_auth_challenge(&payload).await.is_ok() {
                                 conn.authenticated.store(true, Ordering::Relaxed);
+                                conn.heartbeat_miss_count.store(0, Ordering::Relaxed);
+                                info!(
+                                    "{} tcp_tunnel {} #{} authenticated",
+                                    this.tag, conn.remote_addr, conn_id
+                                );
                             }
                         }
                         MSG_TYPE_HEARTBEAT => {
                             let hb = this.auth.create_heartbeat(true);
                             Self::send_frame(&conn.tx, hb, this.send_timeout).await;
                             *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                            conn.heartbeat_miss_count.store(0, Ordering::Relaxed);
                             *conn.last_active.write().await = Instant::now();
                         }
                         MSG_TYPE_HEARTBEAT_ACK => {
@@ -266,6 +301,7 @@ impl TcpTunnelForwardComponent {
                                 this.auth.record_delay(ts.elapsed()).await;
                             }
                             *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
+                            conn.heartbeat_miss_count.store(0, Ordering::Relaxed);
                             *conn.last_active.write().await = Instant::now();
                         }
                         _ => {}
@@ -274,9 +310,18 @@ impl TcpTunnelForwardComponent {
                 }
             }
 
-            target_for_reader.conns.remove(&conn_id);
+            if target_for_reader.conns.remove(&conn_id).is_some() {
+                info!(
+                    "{} tcp_tunnel {} #{} removed, waiting reconnect",
+                    this.tag, conn.remote_addr, conn_id
+                );
+            }
         });
 
+        info!(
+            "{} tcp_tunnel {} #{} established",
+            self.tag, target.addr, conn_id
+        );
         Ok(())
     }
 

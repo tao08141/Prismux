@@ -39,10 +39,16 @@ struct ForwardPeer {
     has_traffic: AtomicBool,
     auth_retry_count: AtomicU32,
     heartbeat_miss_count: AtomicU32,
+    send_refusal_count: AtomicU32,
     last_reconnect_at: SystemTime,
     last_heartbeat_at: RwLock<Option<SystemTime>>,
     last_heartbeat_sent: RwLock<Option<Instant>>,
 }
+
+const AUTH_RETRY_RECONNECT_THRESHOLD: u32 = 5;
+const HEARTBEAT_MISS_REAUTH_THRESHOLD: u32 = 2;
+const HEARTBEAT_MISS_RECONNECT_THRESHOLD: u32 = 5;
+const SEND_REFUSAL_RECONNECT_THRESHOLD: u32 = 2;
 
 pub struct ForwardComponent {
     tag: String,
@@ -116,6 +122,7 @@ impl ForwardComponent {
             has_traffic: AtomicBool::new(false),
             auth_retry_count: AtomicU32::new(0),
             heartbeat_miss_count: AtomicU32::new(0),
+            send_refusal_count: AtomicU32::new(0),
             last_reconnect_at: SystemTime::now(),
             last_heartbeat_at: RwLock::new(None),
             last_heartbeat_sent: RwLock::new(None),
@@ -141,6 +148,10 @@ impl ForwardComponent {
                         if !peer.authenticated.load(Ordering::Relaxed) {
                             continue;
                         }
+                        peer.heartbeat_miss_count.store(0, Ordering::Relaxed);
+                        peer.send_refusal_count.store(0, Ordering::Relaxed);
+                        let mut ts = peer.last_heartbeat_at.write().await;
+                        *ts = Some(SystemTime::now());
                         let packet = Packet {
                             data: payload,
                             src_tag: Arc::clone(&self.tag_arc),
@@ -158,6 +169,11 @@ impl ForwardComponent {
                         MSG_TYPE_AUTH_RESPONSE => {
                             if auth.process_auth_challenge(&payload).await.is_ok() {
                                 peer.authenticated.store(true, Ordering::Relaxed);
+                                peer.auth_retry_count.store(0, Ordering::Relaxed);
+                                peer.heartbeat_miss_count.store(0, Ordering::Relaxed);
+                                peer.send_refusal_count.store(0, Ordering::Relaxed);
+                                *peer.last_heartbeat_at.write().await = Some(SystemTime::now());
+                                info!("{} authenticated {}", self.tag, peer.addr);
                             }
                         }
                         MSG_TYPE_HEARTBEAT => {
@@ -165,6 +181,8 @@ impl ForwardComponent {
                             let _ = peer.socket.send(&hb).await;
                             let mut ts = peer.last_heartbeat_at.write().await;
                             *ts = Some(SystemTime::now());
+                            peer.heartbeat_miss_count.store(0, Ordering::Relaxed);
+                            peer.send_refusal_count.store(0, Ordering::Relaxed);
                         }
                         MSG_TYPE_HEARTBEAT_ACK => {
                             let mut lock = peer.last_heartbeat_sent.write().await;
@@ -173,6 +191,8 @@ impl ForwardComponent {
                             }
                             let mut ts = peer.last_heartbeat_at.write().await;
                             *ts = Some(SystemTime::now());
+                            peer.heartbeat_miss_count.store(0, Ordering::Relaxed);
+                            peer.send_refusal_count.store(0, Ordering::Relaxed);
                         }
                         MSG_TYPE_DATA => {}
                         _ => {}
@@ -194,11 +214,33 @@ impl ForwardComponent {
         }
 
         peer.authenticated.store(false, Ordering::Relaxed);
-        if let Some(current) = self.peers.get(&peer.remote) {
-            if Arc::ptr_eq(current.value(), &peer) {
+        if self.running.load(Ordering::Relaxed) && self.detach_peer_if_current(&peer.remote, &peer)
+        {
+            warn!(
+                "{} peer {} closed, waiting for reconnect",
+                self.tag, peer.addr
+            );
+        }
+    }
+
+    fn detach_peer_if_current(&self, remote: &str, peer: &Arc<ForwardPeer>) -> bool {
+        if let Some(current) = self.peers.get(remote) {
+            if Arc::ptr_eq(current.value(), peer) {
                 drop(current);
-                self.peers.remove(&peer.remote);
+                self.peers.remove(remote);
+                return true;
             }
+        }
+        false
+    }
+
+    fn mark_peer_for_reconnect(&self, remote: &str, peer: &Arc<ForwardPeer>, reason: &str) {
+        peer.authenticated.store(false, Ordering::Relaxed);
+        if self.detach_peer_if_current(remote, peer) {
+            warn!(
+                "{} peer {} marked for reconnect: {}",
+                self.tag, peer.addr, reason
+            );
         }
     }
 
@@ -212,24 +254,49 @@ impl ForwardComponent {
                 }
             };
 
-            let needs_connect = match self.peers.get(addr) {
-                Some(peer) if peer.addr == resolved => false,
-                Some(peer) => {
-                    debug!(
-                        "{} forwarder {} changed {} -> {}, reconnecting",
-                        self.tag, addr, peer.addr, resolved
-                    );
-                    true
-                }
-                None => true,
-            };
+            let existing = self.peers.get(addr).map(|p| Arc::clone(p.value()));
+            let mut reconnect_reason = None::<String>;
 
-            if needs_connect {
-                if let Some((_, old_peer)) = self.peers.remove(addr) {
-                    old_peer.authenticated.store(false, Ordering::Relaxed);
+            match existing.as_ref() {
+                Some(peer) if peer.addr != resolved => {
+                    reconnect_reason =
+                        Some(format!("target changed {} -> {}", peer.addr, resolved));
                 }
-                if let Err(err) = self.connect_one(router, addr, resolved).await {
-                    debug!("{} reconnect {} failed: {err}", self.tag, addr);
+                Some(peer) => {
+                    if let Some(auth) = &self.auth {
+                        if !peer.authenticated.load(Ordering::Relaxed) {
+                            let retries = peer.auth_retry_count.load(Ordering::Relaxed);
+                            if retries >= AUTH_RETRY_RECONNECT_THRESHOLD {
+                                reconnect_reason =
+                                    Some(format!("auth retries exhausted ({retries})"));
+                            }
+                        } else {
+                            let last_heartbeat = *peer.last_heartbeat_at.read().await;
+                            if let Some(ts) = last_heartbeat {
+                                if let Ok(elapsed) = ts.elapsed() {
+                                    let stale_for = auth.heartbeat_interval.saturating_mul(3);
+                                    if elapsed >= stale_for {
+                                        reconnect_reason =
+                                            Some(format!("heartbeat stale for {elapsed:?}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    reconnect_reason = Some("missing peer".to_string());
+                }
+            }
+
+            if let Some(reason) = reconnect_reason {
+                if let Some(peer) = existing {
+                    self.detach_peer_if_current(addr, &peer);
+                }
+                info!("{} reconnect {}: {}", self.tag, addr, reason);
+                match self.connect_one(router, addr, resolved).await {
+                    Ok(()) => info!("{} reconnect {} succeeded", self.tag, addr),
+                    Err(err) => warn!("{} reconnect {} failed: {err}", self.tag, addr),
                 }
             }
         }
@@ -242,15 +309,51 @@ impl ForwardComponent {
             };
             if peer.authenticated.load(Ordering::Relaxed) {
                 let hb = auth.create_heartbeat(false);
-                let _ = peer.socket.send(&hb).await;
-                let mut last = peer.last_heartbeat_sent.write().await;
-                if last.is_some() {
-                    peer.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = peer.socket.send(&hb).await {
+                    self.mark_peer_for_reconnect(
+                        addr,
+                        &peer,
+                        &format!("heartbeat send failed: {err}"),
+                    );
+                    continue;
                 }
+
+                let mut last = peer.last_heartbeat_sent.write().await;
+                let misses = if last.is_some() {
+                    peer.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed) + 1
+                } else {
+                    peer.heartbeat_miss_count.load(Ordering::Relaxed)
+                };
                 *last = Some(Instant::now());
-                let mut ts = peer.last_heartbeat_at.write().await;
-                *ts = Some(SystemTime::now());
+
+                if misses >= HEARTBEAT_MISS_REAUTH_THRESHOLD
+                    && peer.authenticated.swap(false, Ordering::Relaxed)
+                {
+                    *last = None;
+                    warn!(
+                        "{} heartbeat miss {} on {}, switching to re-auth",
+                        self.tag, misses, peer.addr
+                    );
+                }
+
+                if misses >= HEARTBEAT_MISS_RECONNECT_THRESHOLD {
+                    self.mark_peer_for_reconnect(
+                        addr,
+                        &peer,
+                        &format!("heartbeat timeout ({misses} misses)"),
+                    );
+                }
             } else {
+                let retries = peer.auth_retry_count.load(Ordering::Relaxed);
+                if retries >= AUTH_RETRY_RECONNECT_THRESHOLD {
+                    self.mark_peer_for_reconnect(
+                        addr,
+                        &peer,
+                        &format!("auth retries exhausted ({retries})"),
+                    );
+                    continue;
+                }
+
                 let mut pool_id = [0u8; 8];
                 rand::thread_rng().fill(&mut pool_id);
                 if let Ok(challenge) = auth
@@ -261,8 +364,19 @@ impl ForwardComponent {
                     )
                     .await
                 {
-                    peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
-                    let _ = peer.socket.send(&challenge).await;
+                    let attempt = peer.auth_retry_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Err(err) = peer.socket.send(&challenge).await {
+                        self.mark_peer_for_reconnect(
+                            addr,
+                            &peer,
+                            &format!("auth challenge send failed: {err}"),
+                        );
+                    } else {
+                        debug!(
+                            "{} auth challenge {} attempt {}",
+                            self.tag, peer.addr, attempt
+                        );
+                    }
                 }
             }
         }
@@ -276,7 +390,9 @@ impl ForwardComponent {
             if !peer.has_traffic.load(Ordering::Relaxed) {
                 continue;
             }
-            let _ = peer.socket.send(&[]).await;
+            if let Err(err) = peer.socket.send(&[]).await {
+                self.mark_peer_for_reconnect(addr, &peer, &format!("keepalive send failed: {err}"));
+            }
         }
     }
 
@@ -448,8 +564,9 @@ impl Component for ForwardComponent {
                     continue;
                 }
             };
-            if let Err(err) = self.connect_one(&router, addr, resolved).await {
-                warn!("{} connect {} failed: {err}", self.tag, addr);
+            match self.connect_one(&router, addr, resolved).await {
+                Ok(()) => info!("{} connected {}", self.tag, addr),
+                Err(err) => warn!("{} connect {} failed: {err}", self.tag, addr),
             }
         }
 
@@ -474,16 +591,29 @@ impl Component for ForwardComponent {
                 continue;
             }
             if let Err(err) = peer.socket.send(&payload).await {
-                peer.authenticated.store(false, Ordering::Relaxed);
-                if let Some(current) = self.peers.get(addr) {
-                    if Arc::ptr_eq(current.value(), &peer) {
-                        drop(current);
-                        self.peers.remove(addr);
+                let kind = err.kind();
+                // Linux/WSL can transiently return ConnectionRefused for UDP when the
+                // remote port has just restarted or is not ready yet. Dropping the peer
+                // immediately causes avoidable outages during integration tests.
+                if kind == std::io::ErrorKind::ConnectionRefused {
+                    let refusals = peer.send_refusal_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    warn!(
+                        "{} transient send refusal to {} (count {}): {err}",
+                        self.tag, peer.addr, refusals
+                    );
+                    if refusals >= SEND_REFUSAL_RECONNECT_THRESHOLD {
+                        self.mark_peer_for_reconnect(
+                            addr,
+                            &peer,
+                            &format!("consecutive send refusal ({refusals})"),
+                        );
                     }
+                    continue;
                 }
-                warn!("{} send to {} failed: {err}", self.tag, peer.addr);
+                self.mark_peer_for_reconnect(addr, &peer, &format!("send failed: {err}"));
             } else {
                 peer.has_traffic.store(true, Ordering::Relaxed);
+                peer.send_refusal_count.store(0, Ordering::Relaxed);
             }
         }
 

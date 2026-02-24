@@ -251,12 +251,15 @@ impl Component for IPRouterComponent {
     }
 
     async fn start(self: Arc<Self>, _router: Arc<Router>) -> Result<()> {
-        if !self.geoip_url.is_empty() {
-            if let Err(err) = self.download_and_swap().await {
-                warn!("{} initial geoip update failed: {err}", self.tag);
-            }
-        }
         self.start_updater_if_needed();
+        if !self.geoip_url.is_empty() {
+            let this = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(err) = this.download_and_swap().await {
+                    warn!("{} initial geoip update failed: {err}", this.tag);
+                }
+            });
+        }
         Ok(())
     }
 

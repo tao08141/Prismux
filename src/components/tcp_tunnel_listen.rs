@@ -49,6 +49,7 @@ pub struct TcpTunnelListenComponent {
     tag: String,
     tag_arc: Arc<str>,
     listen_addr: String,
+    timeout: Duration,
     detour: Arc<[String]>,
     auth: AuthManager,
     send_timeout: Duration,
@@ -67,6 +68,7 @@ impl TcpTunnelListenComponent {
             .ok_or_else(|| anyhow!("tcp_tunnel_listen requires auth.enabled=true"))?;
         let tag = cfg.tag;
         let tag_arc = Arc::<str>::from(tag.as_str());
+        let timeout = Duration::from_secs(if cfg.timeout == 0 { 30 } else { cfg.timeout });
         let no_delay = cfg.no_delay.unwrap_or(true);
         let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
         let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
@@ -75,6 +77,7 @@ impl TcpTunnelListenComponent {
             tag,
             tag_arc,
             listen_addr: cfg.listen_addr,
+            timeout,
             detour: Arc::<[String]>::from(cfg.detour),
             auth,
             send_timeout: Duration::from_millis(if cfg.send_timeout == 0 {
@@ -154,6 +157,7 @@ impl TcpTunnelListenComponent {
         });
 
         self.conns.insert(id, Arc::clone(&conn));
+        let auth_started_at = Instant::now();
 
         let write_task = tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
@@ -164,8 +168,42 @@ impl TcpTunnelListenComponent {
         });
 
         loop {
-            if read_frame_into(&mut reader, &mut frame_buf).await.is_err() {
+            if !conn.authenticated.load(Ordering::Relaxed)
+                && auth_started_at.elapsed() > self.auth.auth_timeout
+            {
+                debug!(
+                    "{} tcp {} auth timeout after {}s",
+                    self.tag,
+                    conn.remote_addr,
+                    self.auth.auth_timeout.as_secs()
+                );
                 break;
+            }
+
+            let read_timeout = if conn.authenticated.load(Ordering::Relaxed) {
+                self.timeout
+            } else {
+                self.timeout.min(self.auth.auth_timeout)
+            };
+
+            match time::timeout(read_timeout, read_frame_into(&mut reader, &mut frame_buf)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    debug!(
+                        "{} tcp {} read frame error: {err}",
+                        self.tag, conn.remote_addr
+                    );
+                    break;
+                }
+                Err(_) => {
+                    debug!(
+                        "{} tcp {} idle timeout after {}s",
+                        self.tag,
+                        conn.remote_addr,
+                        read_timeout.as_secs()
+                    );
+                    break;
+                }
             }
 
             match self.auth.unwrap_frame(&frame_buf) {
@@ -190,6 +228,7 @@ impl TcpTunnelListenComponent {
                             self.auth.process_auth_challenge(&payload).await
                         {
                             conn.authenticated.store(true, Ordering::Relaxed);
+                            *conn.last_active.write().await = Instant::now();
                             conn.forward_id
                                 .store(u64::from_be_bytes(forward_id), Ordering::Relaxed);
                             conn.pool_id
@@ -222,6 +261,7 @@ impl TcpTunnelListenComponent {
                         if let Some(ts) = lock.take() {
                             self.auth.record_delay(ts.elapsed()).await;
                         }
+                        *conn.last_active.write().await = Instant::now();
                         *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
                     }
                     _ => {}
@@ -251,6 +291,7 @@ impl TcpTunnelListenComponent {
             "tag": self.tag,
             "type": "tcp_tunnel_listen",
             "listen_addr": self.listen_addr,
+            "timeout": self.timeout.as_secs(),
             "detour": self.detour.to_vec(),
         })
     }
