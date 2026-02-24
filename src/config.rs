@@ -43,10 +43,10 @@ pub struct LoggingConfig {
     pub level: String,
     #[serde(default = "default_log_format")]
     pub format: String,
-    #[serde(default = "default_output")]
-    pub output_path: String,
-    #[serde(default)]
-    pub caller: bool,
+    #[serde(default = "default_output", rename = "output_path")]
+    pub _output_path: String,
+    #[serde(default, rename = "caller")]
+    pub _caller: bool,
 }
 
 fn default_log_level() -> String {
@@ -75,8 +75,8 @@ pub struct ApiConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComponentConfig {
-    #[serde(default)]
-    pub r#type: String,
+    #[serde(default, rename = "type")]
+    pub _type: String,
     #[serde(default)]
     pub tag: String,
     #[serde(default)]
@@ -111,8 +111,8 @@ pub struct ComponentConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FilterComponentConfig {
-    #[serde(default)]
-    pub r#type: String,
+    #[serde(default, rename = "type")]
+    pub _type: String,
     #[serde(default)]
     pub tag: String,
     #[serde(default)]
@@ -131,8 +131,8 @@ pub struct LoadBalancerDetourRule {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoadBalancerComponentConfig {
-    #[serde(default)]
-    pub r#type: String,
+    #[serde(default, rename = "type")]
+    pub _type: String,
     #[serde(default)]
     pub tag: String,
     #[serde(default)]
@@ -141,8 +141,8 @@ pub struct LoadBalancerComponentConfig {
     pub miss: Vec<String>,
     #[serde(default = "default_window_size")]
     pub window_size: u32,
-    #[serde(default)]
-    pub enable_cache: bool,
+    #[serde(default, rename = "enable_cache")]
+    pub _enable_cache: bool,
 }
 
 fn default_window_size() -> u32 {
@@ -151,8 +151,8 @@ fn default_window_size() -> u32 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IPRouteComponentConfig {
-    #[serde(default)]
-    pub r#type: String,
+    #[serde(default, rename = "type")]
+    pub _type: String,
     #[serde(default)]
     pub tag: String,
     #[serde(default)]
@@ -225,8 +225,8 @@ pub struct ProtocolDefinition {
     pub signatures: Vec<SignatureRule>,
     #[serde(default)]
     pub match_logic: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub priority: i32,
+    #[serde(default, rename = "description")]
+    pub _description: String,
+    #[serde(default, rename = "priority")]
+    pub _priority: i32,
 }

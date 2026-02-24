@@ -46,7 +46,6 @@ pub struct ListenComponent {
     replace_old_mapping: bool,
     detour: Arc<[String]>,
     broadcast_mode: bool,
-    send_timeout: Duration,
     recv_buffer_size: usize,
     send_buffer_size: usize,
     auth: Option<AuthManager>,
@@ -59,7 +58,6 @@ pub struct ListenComponent {
 impl ListenComponent {
     pub fn new(cfg: ComponentConfig) -> Result<Arc<Self>> {
         let timeout = Duration::from_secs(cfg.timeout.max(1));
-        let send_timeout = Duration::from_millis(cfg.send_timeout.max(1));
         let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
         let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
         let auth = AuthManager::from_config(cfg.auth.as_ref())?;
@@ -74,7 +72,6 @@ impl ListenComponent {
             replace_old_mapping: cfg.replace_old_mapping,
             detour: Arc::<[String]>::from(cfg.detour),
             broadcast_mode: cfg.broadcast_mode.unwrap_or(true),
-            send_timeout,
             recv_buffer_size,
             send_buffer_size,
             auth,
@@ -114,10 +111,23 @@ impl ListenComponent {
         while self.running.load(Ordering::Relaxed) {
             ticker.tick().await;
             let timeout = self.timeout;
-            let before = self.mappings.len();
-            self.mappings
-                .retain(|_, conn| conn.last_active.elapsed() <= timeout);
-            if self.mappings.len() != before {
+            let expired: Vec<(SocketAddr, u64)> = self
+                .mappings
+                .iter()
+                .filter_map(|entry| {
+                    (entry.value().last_active.elapsed() > timeout)
+                        .then_some((*entry.key(), entry.value().conn_id))
+                })
+                .collect();
+            if !expired.is_empty() {
+                for (addr, conn_id) in expired {
+                    if self.mappings.remove(&addr).is_some() {
+                        info!(
+                            "{} disconnected {} conn_id={} reason=idle-timeout",
+                            self.tag, addr, conn_id
+                        );
+                    }
+                }
                 self.refresh_broadcast_targets();
             }
         }
@@ -214,7 +224,11 @@ impl ListenComponent {
                         return Ok(());
                     }
                     MSG_TYPE_DISCONNECT => {
-                        if self.mappings.remove(&addr).is_some() {
+                        if let Some((_, conn)) = self.mappings.remove(&addr) {
+                            info!(
+                                "{} disconnected {} conn_id={} reason=peer-disconnect",
+                                self.tag, addr, conn.conn_id
+                            );
                             self.refresh_broadcast_targets();
                         }
                         return Ok(());
@@ -255,6 +269,10 @@ impl ListenComponent {
             if authenticated && !existing.authenticated {
                 existing.authenticated = true;
                 changed = true;
+                info!(
+                    "{} connection {} conn_id={} authenticated",
+                    self.tag, addr, existing.conn_id
+                );
             }
             if conn_override != 0 && existing.conn_id != conn_override {
                 existing.conn_id = conn_override;
@@ -276,7 +294,12 @@ impl ListenComponent {
                 })
                 .collect();
             for old in same_ip {
-                let _ = self.mappings.remove(&old);
+                if let Some((_, old_conn)) = self.mappings.remove(&old) {
+                    info!(
+                        "{} disconnected {} conn_id={} reason=replaced-by-new-connection {}",
+                        self.tag, old, old_conn.conn_id, addr
+                    );
+                }
             }
         }
 
@@ -294,6 +317,10 @@ impl ListenComponent {
                 authenticated,
                 last_heartbeat_sent: None,
             },
+        );
+        info!(
+            "{} connected {} conn_id={} authenticated={}",
+            self.tag, addr, conn_id, authenticated
         );
         (conn_id, true)
     }
@@ -431,7 +458,9 @@ impl Component for ListenComponent {
                 .find_map(|entry| (entry.conn_id == packet.conn_id).then_some(*entry.key()));
 
             if let Some(addr) = target {
-                let _ = socket.send_to(&payload, addr).await;
+                if let Err(err) = socket.send_to(&payload, addr).await {
+                    warn!("{} send error to {}: {err}", self.tag, addr);
+                }
             }
         }
 

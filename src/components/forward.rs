@@ -48,7 +48,7 @@ struct ForwardPeer {
 const AUTH_RETRY_RECONNECT_THRESHOLD: u32 = 5;
 const HEARTBEAT_MISS_REAUTH_THRESHOLD: u32 = 2;
 const HEARTBEAT_MISS_RECONNECT_THRESHOLD: u32 = 5;
-const SEND_REFUSAL_RECONNECT_THRESHOLD: u32 = 2;
+const SEND_REFUSAL_RECONNECT_THRESHOLD: u32 = 1;
 
 pub struct ForwardComponent {
     tag: String,
@@ -58,7 +58,6 @@ pub struct ForwardComponent {
     reconnect_interval: Duration,
     check_interval: Duration,
     send_keepalive: bool,
-    send_timeout: Duration,
     recv_buffer_size: usize,
     send_buffer_size: usize,
     auth: Option<AuthManager>,
@@ -72,7 +71,6 @@ impl ForwardComponent {
         let auth = AuthManager::from_config(cfg.auth.as_ref())?;
         let reconnect_interval = Duration::from_secs(cfg.reconnect_interval.max(1));
         let check_interval = Duration::from_secs(cfg.connection_check_time.max(1));
-        let send_timeout = Duration::from_millis(cfg.send_timeout.max(1));
         let recv_buffer_size = cfg.recv_buffer_size.max(2 * 1024 * 1024);
         let send_buffer_size = cfg.send_buffer_size.max(2 * 1024 * 1024);
         let send_keepalive = cfg.send_keepalive.unwrap_or(true);
@@ -90,7 +88,6 @@ impl ForwardComponent {
             reconnect_interval,
             check_interval,
             send_keepalive,
-            send_timeout,
             recv_buffer_size,
             send_buffer_size,
             auth,
@@ -134,9 +131,14 @@ impl ForwardComponent {
             vec![0u8; router.config.buffer_size.max(2048) + router.config.buffer_offset];
 
         while self.running.load(Ordering::Relaxed) {
-            let recv = peer.socket.recv(&mut buffer).await;
-            let Ok(n) = recv else {
-                break;
+            let n = match peer.socket.recv(&mut buffer).await {
+                Ok(n) => n,
+                Err(err) => {
+                    if self.running.load(Ordering::Relaxed) {
+                        warn!("{} peer {} recv failed: {err}", self.tag, peer.addr);
+                    }
+                    break;
+                }
             };
             if n == 0 {
                 continue;
@@ -291,7 +293,12 @@ impl ForwardComponent {
 
             if let Some(reason) = reconnect_reason {
                 if let Some(peer) = existing {
-                    self.detach_peer_if_current(addr, &peer);
+                    if self.detach_peer_if_current(addr, &peer) {
+                        info!(
+                            "{} peer {} removed before reconnect: {}",
+                            self.tag, peer.addr, reason
+                        );
+                    }
                 }
                 info!("{} reconnect {}: {}", self.tag, addr, reason);
                 match self.connect_one(router, addr, resolved).await {
@@ -473,12 +480,24 @@ impl ForwardComponent {
                 .await?;
             peer.auth_retry_count.fetch_add(1, Ordering::Relaxed);
             let _ = peer.socket.send(&challenge).await?;
+            info!(
+                "{} peer {} connected (resolved {}, auth pending)",
+                self.tag, addr_str, addr
+            );
         } else {
             peer.authenticated.store(true, Ordering::Relaxed);
+            info!(
+                "{} peer {} connected (resolved {})",
+                self.tag, addr_str, addr
+            );
         }
 
         if let Some(old_peer) = self.peers.insert(addr_str.to_string(), Arc::clone(&peer)) {
             old_peer.authenticated.store(false, Ordering::Relaxed);
+            info!(
+                "{} peer {} replaced old connection {} -> {}",
+                self.tag, addr_str, old_peer.addr, peer.addr
+            );
         }
         tokio::spawn(Arc::clone(self).read_loop(Arc::clone(router), peer));
         Ok(())

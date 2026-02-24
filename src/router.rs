@@ -62,10 +62,6 @@ impl Router {
         self.components.contains_key(tag)
     }
 
-    pub fn all_component_tags(&self) -> Vec<String> {
-        self.components.iter().map(|v| v.key().clone()).collect()
-    }
-
     pub async fn route_shared(&self, packet: Packet, destinations: Arc<[String]>) -> Result<()> {
         if destinations.is_empty() {
             return Ok(());
@@ -94,14 +90,6 @@ impl Router {
                 .await
                 .map_err(|_| anyhow!("routing queue closed")),
         }
-    }
-
-    pub async fn route(&self, packet: Packet, dest_tags: &[String]) -> Result<()> {
-        if dest_tags.is_empty() {
-            return Ok(());
-        }
-        self.route_shared(packet, Arc::<[String]>::from(dest_tags.to_vec()))
-            .await
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {

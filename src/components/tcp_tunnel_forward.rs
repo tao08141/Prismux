@@ -198,6 +198,14 @@ impl TcpTunnelForwardComponent {
         let _ = sock_ref.set_recv_buffer_size(self.recv_buffer_size);
         let _ = sock_ref.set_send_buffer_size(self.send_buffer_size);
         let stream = TcpStream::from_std(std_stream)?;
+        let local_addr = stream
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let peer_addr = stream
+            .peer_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| target.addr.clone());
         let (mut reader, mut writer) = stream.into_split();
 
         let queue_cap = router.config.queue_size.max(16384).min(131072);
@@ -222,19 +230,21 @@ impl TcpTunnelForwardComponent {
         let writer_tag = self.tag.clone();
         let writer_remote = target.addr.clone();
         tokio::spawn(async move {
+            let mut close_reason = "writer-queue-closed".to_string();
             while let Some(frame) = rx.recv().await {
                 if let Err(err) = write_frame(&mut writer, &frame).await {
                     warn!(
                         "{} tcp_tunnel writer {} #{} closed: {err}",
                         writer_tag, writer_remote, writer_conn_id
                     );
+                    close_reason = format!("writer-io-error: {err}");
                     break;
                 }
             }
             if target_for_writer.conns.remove(&writer_conn_id).is_some() {
                 info!(
-                    "{} tcp_tunnel {} #{} removed, waiting reconnect",
-                    writer_tag, writer_remote, writer_conn_id
+                    "{} tcp_tunnel {} #{} disconnected ({}), waiting reconnect",
+                    writer_tag, writer_remote, writer_conn_id, close_reason
                 );
             }
         });
@@ -319,8 +329,8 @@ impl TcpTunnelForwardComponent {
         });
 
         info!(
-            "{} tcp_tunnel {} #{} established",
-            self.tag, target.addr, conn_id
+            "{} tcp_tunnel {} #{} established local={} peer={}",
+            self.tag, target.addr, conn_id, local_addr, peer_addr
         );
         Ok(())
     }

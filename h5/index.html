@@ -526,19 +526,20 @@
             if (!comp || !Array.isArray(comp.connections)) return [];
             if (comp.type !== 'listen' && comp.type !== 'forward') return [];
 
-            const ips = [];
+            const endpoints = [];
             comp.connections.forEach(conn => {
                 if (!conn || typeof conn !== 'object') return;
                 if (comp.type === 'listen') {
-                    const ip = conn.ip || extractHostFromAddress(conn.address);
-                    if (ip) ips.push(ip);
+                    const endpoint = conn.address
+                        || ((conn.ip && conn.port !== undefined) ? `${conn.ip}:${conn.port}` : '');
+                    if (endpoint) endpoints.push(endpoint);
                     return;
                 }
-                const ip = conn.resolved_ip || extractHostFromAddress(conn.resolved_addr || '');
-                if (ip) ips.push(ip);
+                const endpoint = conn.resolved_addr || conn.remote_addr || '';
+                if (endpoint) endpoints.push(endpoint);
             });
 
-            return [...new Set(ips)];
+            return [...new Set(endpoints)];
         }
 
         function handleCardClick(tag) {
@@ -619,7 +620,7 @@
                 if (ipList.length > 0) {
                     const shownIps = ipList.slice(0, 3).join(', ');
                     const more = ipList.length > 3 ? ` (+${ipList.length - 3})` : '';
-                    detailsHtml += `<p><span class="param-key">IP:</span> ${shownIps}${more}</p>`;
+                    detailsHtml += `<p><span class="param-key">IP:端口:</span> ${shownIps}${more}</p>`;
                 }
 
                 if (comp.average_delay_ms !== undefined) {

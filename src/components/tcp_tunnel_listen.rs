@@ -30,7 +30,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     time,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 struct TunnelListenConn {
     tx: mpsc::Sender<Bytes>,
@@ -97,12 +97,17 @@ impl TcpTunnelListenComponent {
 
     async fn accept_loop(self: Arc<Self>, router: Arc<Router>, listener: TcpListener) {
         while self.running.load(Ordering::Relaxed) {
-            let accept = listener.accept().await;
-            let Ok((stream, remote)) = accept else {
-                continue;
+            let (stream, remote) = match listener.accept().await {
+                Ok(v) => v,
+                Err(err) => {
+                    if self.running.load(Ordering::Relaxed) {
+                        warn!("{} accept tcp tunnel failed: {err}", self.tag);
+                    }
+                    continue;
+                }
             };
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            info!("{} accepted TCP tunnel from {}", self.tag, remote);
+            info!("{} accepted TCP tunnel from {} #{}", self.tag, remote, id);
             tokio::spawn(Arc::clone(&self).handle_stream(
                 Arc::clone(&router),
                 id,
@@ -119,10 +124,14 @@ impl TcpTunnelListenComponent {
         stream: TcpStream,
         remote_addr: String,
     ) {
+        let remote_addr_for_log = remote_addr.clone();
         let std_stream = match stream.into_std() {
             Ok(s) => s,
             Err(err) => {
-                debug!("{} failed to convert tcp stream: {err}", self.tag);
+                warn!(
+                    "{} tcp {} #{} convert std stream failed: {err}",
+                    self.tag, remote_addr_for_log, id
+                );
                 return;
             }
         };
@@ -134,7 +143,10 @@ impl TcpTunnelListenComponent {
         let stream = match TcpStream::from_std(std_stream) {
             Ok(s) => s,
             Err(err) => {
-                debug!("{} failed to restore tokio tcp stream: {err}", self.tag);
+                warn!(
+                    "{} tcp {} #{} convert tokio stream failed: {err}",
+                    self.tag, remote_addr_for_log, id
+                );
                 return;
             }
         };
@@ -158,13 +170,26 @@ impl TcpTunnelListenComponent {
 
         self.conns.insert(id, Arc::clone(&conn));
         let auth_started_at = Instant::now();
+        info!("{} tcp {} #{} connected", self.tag, conn.remote_addr, id);
 
+        let write_tag = self.tag.clone();
+        let write_remote = conn.remote_addr.clone();
         let write_task = tokio::spawn(async move {
+            let mut close_reason = "writer-queue-closed".to_string();
             while let Some(frame) = rx.recv().await {
-                if write_frame(&mut writer, &frame).await.is_err() {
+                if let Err(err) = write_frame(&mut writer, &frame).await {
+                    warn!(
+                        "{} tcp {} #{} writer closed: {err}",
+                        write_tag, write_remote, id
+                    );
+                    close_reason = format!("writer-io-error: {err}");
                     break;
                 }
             }
+            info!(
+                "{} tcp {} #{} writer exit reason={}",
+                write_tag, write_remote, id, close_reason
+            );
         });
 
         loop {
@@ -176,6 +201,10 @@ impl TcpTunnelListenComponent {
                     self.tag,
                     conn.remote_addr,
                     self.auth.auth_timeout.as_secs()
+                );
+                info!(
+                    "{} tcp {} #{} disconnected reason=auth-timeout",
+                    self.tag, conn.remote_addr, id
                 );
                 break;
             }
@@ -193,6 +222,10 @@ impl TcpTunnelListenComponent {
                         "{} tcp {} read frame error: {err}",
                         self.tag, conn.remote_addr
                     );
+                    info!(
+                        "{} tcp {} #{} disconnected reason=read-error",
+                        self.tag, conn.remote_addr, id
+                    );
                     break;
                 }
                 Err(_) => {
@@ -201,6 +234,10 @@ impl TcpTunnelListenComponent {
                         self.tag,
                         conn.remote_addr,
                         read_timeout.as_secs()
+                    );
+                    info!(
+                        "{} tcp {} #{} disconnected reason=idle-timeout",
+                        self.tag, conn.remote_addr, id
                     );
                     break;
                 }
@@ -248,6 +285,10 @@ impl TcpTunnelListenComponent {
                             {
                                 Self::send_frame(&conn.tx, resp, self.send_timeout).await;
                             }
+                            info!(
+                                "{} tcp {} #{} authenticated",
+                                self.tag, conn.remote_addr, id
+                            );
                         }
                     }
                     MSG_TYPE_HEARTBEAT => {
@@ -274,7 +315,9 @@ impl TcpTunnelListenComponent {
             }
         }
 
-        self.conns.remove(&id);
+        if self.conns.remove(&id).is_some() {
+            info!("{} tcp {} #{} disconnected", self.tag, conn.remote_addr, id);
+        }
         write_task.abort();
     }
 
