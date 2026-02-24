@@ -194,9 +194,12 @@ impl ListenComponent {
                         return Ok(());
                     }
                     MSG_TYPE_HEARTBEAT => {
-                        let hb = auth.create_heartbeat(true);
-                        socket.send_to(&hb, addr).await?;
                         if let Some(mut mapping) = self.mappings.get_mut(&addr) {
+                            if !mapping.authenticated {
+                                return Ok(());
+                            }
+                            let hb = auth.create_heartbeat(true);
+                            socket.send_to(&hb, addr).await?;
                             mapping.last_active = Instant::now();
                         }
                         return Ok(());
