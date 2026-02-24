@@ -123,6 +123,39 @@ impl ListenComponent {
         }
     }
 
+    async fn heartbeat_loop(self: Arc<Self>) {
+        let Some(auth) = self.auth.clone() else {
+            return;
+        };
+        let mut ticker = time::interval(auth.heartbeat_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+
+        while self.running.load(Ordering::Relaxed) {
+            ticker.tick().await;
+
+            let socket = match self.socket().await {
+                Ok(socket) => socket,
+                Err(_) => continue,
+            };
+
+            let targets: Vec<SocketAddr> = self
+                .mappings
+                .iter()
+                .filter_map(|entry| entry.authenticated.then_some(*entry.key()))
+                .collect();
+
+            for addr in targets {
+                let hb = auth.create_heartbeat(false);
+                if socket.send_to(&hb, addr).await.is_ok() {
+                    if let Some(mut mapping) = self.mappings.get_mut(&addr) {
+                        mapping.last_heartbeat_sent = Some(Instant::now());
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_inbound(
         &self,
         router: &Router,
@@ -299,8 +332,11 @@ impl ListenComponent {
 
         for entry in self.mappings.iter() {
             let conn = entry.value();
+            let addr = *entry.key();
             let mut item = json!({
-                "address": entry.key().to_string(),
+                "address": addr.to_string(),
+                "ip": addr.ip().to_string(),
+                "port": addr.port(),
                 "connection_id": format!("{:016x}", conn.conn_id),
                 "last_active": format_from_elapsed(conn.last_active.elapsed()),
             });
@@ -352,6 +388,9 @@ impl Component for ListenComponent {
 
         tokio::spawn(Arc::clone(&self).reader_loop(Arc::clone(&router), Arc::clone(&socket)));
         tokio::spawn(Arc::clone(&self).cleanup_loop());
+        if self.auth.is_some() {
+            tokio::spawn(Arc::clone(&self).heartbeat_loop());
+        }
 
         Ok(())
     }

@@ -509,6 +509,8 @@ impl ForwardComponent {
                     .map(|v| format_system_time(*v));
                 let mut entry = json!({
                     "remote_addr": remote,
+                    "resolved_addr": peer.addr.to_string(),
+                    "resolved_ip": peer.addr.ip().to_string(),
                     "is_connected": true,
                     "last_reconnect": format_system_time(peer.last_reconnect_at),
                     "auth_retry_count": peer.auth_retry_count.load(Ordering::Relaxed),
@@ -522,6 +524,8 @@ impl ForwardComponent {
             } else {
                 connections.push(json!({
                     "remote_addr": remote,
+                    "resolved_addr": Value::Null,
+                    "resolved_ip": Value::Null,
                     "is_connected": false,
                     "last_reconnect": Value::Null,
                     "auth_retry_count": 0,

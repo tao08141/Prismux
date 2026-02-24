@@ -504,6 +504,43 @@
             return [...new Set(targets.filter(t => t))];
         }
 
+        function extractHostFromAddress(addr) {
+            if (!addr || typeof addr !== 'string') return '';
+            const text = addr.trim();
+            if (!text) return '';
+
+            if (text.startsWith('[')) {
+                const end = text.indexOf(']');
+                if (end > 1) return text.slice(1, end);
+            }
+
+            const lastColon = text.lastIndexOf(':');
+            if (lastColon > 0 && text.indexOf(':') === lastColon) {
+                return text.slice(0, lastColon);
+            }
+
+            return text;
+        }
+
+        function getComponentIpList(comp) {
+            if (!comp || !Array.isArray(comp.connections)) return [];
+            if (comp.type !== 'listen' && comp.type !== 'forward') return [];
+
+            const ips = [];
+            comp.connections.forEach(conn => {
+                if (!conn || typeof conn !== 'object') return;
+                if (comp.type === 'listen') {
+                    const ip = conn.ip || extractHostFromAddress(conn.address);
+                    if (ip) ips.push(ip);
+                    return;
+                }
+                const ip = conn.resolved_ip || extractHostFromAddress(conn.resolved_addr || '');
+                if (ip) ips.push(ip);
+            });
+
+            return [...new Set(ips)];
+        }
+
         function handleCardClick(tag) {
             const grid = document.getElementById('grid');
 
@@ -576,6 +613,13 @@
                     detailsHtml += `<p><span class="param-key">当前连接:</span> ${comp.count}</p>`;
                 } else if (comp.total_connections !== undefined) {
                     detailsHtml += `<p><span class="param-key">总连接数:</span> ${comp.total_connections}</p>`;
+                }
+
+                const ipList = getComponentIpList(comp);
+                if (ipList.length > 0) {
+                    const shownIps = ipList.slice(0, 3).join(', ');
+                    const more = ipList.length > 3 ? ` (+${ipList.length - 3})` : '';
+                    detailsHtml += `<p><span class="param-key">IP:</span> ${shownIps}${more}</p>`;
                 }
 
                 if (comp.average_delay_ms !== undefined) {
