@@ -276,16 +276,19 @@ impl ForwardComponent {
     }
 
     async fn connection_maintenance(self: Arc<Self>, router: Arc<Router>) {
-        let mut check_ticker = time::interval(self.check_interval);
-        check_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut reconnect_ticker = time::interval(self.reconnect_interval);
+        reconnect_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Consume the immediate first tick to avoid sending maintenance traffic right after startup.
+        reconnect_ticker.tick().await;
 
         if let Some(auth) = self.auth.clone() {
             let mut hb_ticker = time::interval(auth.heartbeat_interval);
             hb_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            hb_ticker.tick().await;
 
             while self.running.load(Ordering::Relaxed) {
                 tokio::select! {
-                    _ = check_ticker.tick() => {
+                    _ = reconnect_ticker.tick() => {
                         self.reconcile_peers(&router).await;
                     }
                     _ = hb_ticker.tick() => {
@@ -296,12 +299,27 @@ impl ForwardComponent {
             return;
         }
 
-        while self.running.load(Ordering::Relaxed) {
-            check_ticker.tick().await;
-            self.reconcile_peers(&router).await;
-            if self.send_keepalive {
-                self.keepalive_maintenance().await;
+        if self.send_keepalive {
+            let mut keepalive_ticker = time::interval(self.check_interval);
+            keepalive_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            keepalive_ticker.tick().await;
+
+            while self.running.load(Ordering::Relaxed) {
+                tokio::select! {
+                    _ = reconnect_ticker.tick() => {
+                        self.reconcile_peers(&router).await;
+                    }
+                    _ = keepalive_ticker.tick() => {
+                        self.keepalive_maintenance().await;
+                    }
+                }
             }
+            return;
+        }
+
+        while self.running.load(Ordering::Relaxed) {
+            reconnect_ticker.tick().await;
+            self.reconcile_peers(&router).await;
         }
     }
 
