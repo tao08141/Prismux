@@ -36,6 +36,7 @@ struct ForwardPeer {
     addr: SocketAddr,
     socket: Arc<UdpSocket>,
     authenticated: AtomicBool,
+    has_traffic: AtomicBool,
     auth_retry_count: AtomicU32,
     heartbeat_miss_count: AtomicU32,
     last_reconnect_at: SystemTime,
@@ -112,6 +113,7 @@ impl ForwardComponent {
             addr,
             socket,
             authenticated: AtomicBool::new(false),
+            has_traffic: AtomicBool::new(false),
             auth_retry_count: AtomicU32::new(0),
             heartbeat_miss_count: AtomicU32::new(0),
             last_reconnect_at: SystemTime::now(),
@@ -271,6 +273,9 @@ impl ForwardComponent {
             let Some(peer) = self.peers.get(addr).map(|p| Arc::clone(p.value())) else {
                 continue;
             };
+            if !peer.has_traffic.load(Ordering::Relaxed) {
+                continue;
+            }
             let _ = peer.socket.send(&[]).await;
         }
     }
@@ -477,6 +482,8 @@ impl Component for ForwardComponent {
                     }
                 }
                 warn!("{} send to {} failed: {err}", self.tag, peer.addr);
+            } else {
+                peer.has_traffic.store(true, Ordering::Relaxed);
             }
         }
 

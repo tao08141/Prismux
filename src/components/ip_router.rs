@@ -14,7 +14,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{fs, time};
+use tokio::{
+    fs, time,
+    time::{Instant as TokioInstant, MissedTickBehavior},
+};
 use tracing::warn;
 
 enum RuleMatch {
@@ -220,7 +223,13 @@ impl IPRouterComponent {
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let mut ticker = time::interval(this.update_interval);
+            // Avoid immediate second download right after startup. The first
+            // periodic tick should happen after one full interval.
+            let mut ticker = time::interval_at(
+                TokioInstant::now() + this.update_interval,
+                this.update_interval,
+            );
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 if let Err(err) = this.download_and_swap().await {
