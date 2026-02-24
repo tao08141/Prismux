@@ -292,8 +292,11 @@ impl TcpTunnelListenComponent {
                         }
                     }
                     MSG_TYPE_HEARTBEAT => {
-                        let hb = self.auth.create_heartbeat(true);
+                        // Match UDPlex flow:
+                        // forward HEARTBEAT -> listen HEARTBEAT -> forward HEARTBEAT_ACK.
+                        let hb = self.auth.create_heartbeat(false);
                         Self::send_frame(&conn.tx, hb, self.send_timeout).await;
+                        *conn.last_heartbeat_sent.write().await = Some(Instant::now());
                         *conn.last_active.write().await = Instant::now();
                         *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
                         conn.heartbeat_miss_count.store(0, Ordering::Relaxed);
@@ -319,39 +322,6 @@ impl TcpTunnelListenComponent {
             info!("{} tcp {} #{} disconnected", self.tag, conn.remote_addr, id);
         }
         write_task.abort();
-    }
-
-    async fn heartbeat_loop(self: Arc<Self>) {
-        let mut ticker = time::interval(self.auth.heartbeat_interval);
-        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-
-        while self.running.load(Ordering::Relaxed) {
-            ticker.tick().await;
-
-            let targets: Vec<Arc<TunnelListenConn>> = self
-                .conns
-                .iter()
-                .filter_map(|entry| {
-                    entry
-                        .authenticated
-                        .load(Ordering::Relaxed)
-                        .then_some(Arc::clone(entry.value()))
-                })
-                .collect();
-
-            for conn in targets {
-                let hb = self.auth.create_heartbeat(false);
-                Self::send_frame(&conn.tx, hb, self.send_timeout).await;
-
-                let mut sent = conn.last_heartbeat_sent.write().await;
-                if sent.is_some() {
-                    conn.heartbeat_miss_count.fetch_add(1, Ordering::Relaxed);
-                }
-                *sent = Some(Instant::now());
-                *conn.last_heartbeat_at.write().await = Some(SystemTime::now());
-            }
-        }
     }
 
     async fn send_frame(tx: &mpsc::Sender<Bytes>, frame: Bytes, send_timeout: Duration) {
@@ -441,7 +411,6 @@ impl Component for TcpTunnelListenComponent {
         self.running.store(true, Ordering::Relaxed);
         info!("{} listening on tcp {}", self.tag, self.listen_addr);
         tokio::spawn(Arc::clone(&self).accept_loop(router, listener));
-        tokio::spawn(Arc::clone(&self).heartbeat_loop());
         Ok(())
     }
 

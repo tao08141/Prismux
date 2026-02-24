@@ -179,6 +179,12 @@ impl ForwardComponent {
                             }
                         }
                         MSG_TYPE_HEARTBEAT => {
+                            // In UDPlex semantics this heartbeat is the listen-side response
+                            // to our probe; measure RTT before sending final ACK.
+                            let mut lock = peer.last_heartbeat_sent.write().await;
+                            if let Some(sent) = lock.take() {
+                                auth.record_delay(sent.elapsed()).await;
+                            }
                             let hb = auth.create_heartbeat(true);
                             let _ = peer.socket.send(&hb).await;
                             let mut ts = peer.last_heartbeat_at.write().await;

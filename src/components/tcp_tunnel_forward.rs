@@ -299,6 +299,12 @@ impl TcpTunnelForwardComponent {
                             }
                         }
                         MSG_TYPE_HEARTBEAT => {
+                            // This heartbeat is the listen-side response to our probe.
+                            // Record RTT before sending final ACK.
+                            let mut lock = conn.last_heartbeat_sent.write().await;
+                            if let Some(ts) = lock.take() {
+                                this.auth.record_delay(ts.elapsed()).await;
+                            }
                             let hb = this.auth.create_heartbeat(true);
                             Self::send_frame(&conn.tx, hb, this.send_timeout).await;
                             *conn.last_heartbeat_at.write().await = Some(SystemTime::now());

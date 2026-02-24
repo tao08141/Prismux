@@ -133,39 +133,6 @@ impl ListenComponent {
         }
     }
 
-    async fn heartbeat_loop(self: Arc<Self>) {
-        let Some(auth) = self.auth.clone() else {
-            return;
-        };
-        let mut ticker = time::interval(auth.heartbeat_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        ticker.tick().await;
-
-        while self.running.load(Ordering::Relaxed) {
-            ticker.tick().await;
-
-            let socket = match self.socket().await {
-                Ok(socket) => socket,
-                Err(_) => continue,
-            };
-
-            let targets: Vec<SocketAddr> = self
-                .mappings
-                .iter()
-                .filter_map(|entry| entry.authenticated.then_some(*entry.key()))
-                .collect();
-
-            for addr in targets {
-                let hb = auth.create_heartbeat(false);
-                if socket.send_to(&hb, addr).await.is_ok() {
-                    if let Some(mut mapping) = self.mappings.get_mut(&addr) {
-                        mapping.last_heartbeat_sent = Some(Instant::now());
-                    }
-                }
-            }
-        }
-    }
-
     async fn handle_inbound(
         &self,
         router: &Router,
@@ -208,8 +175,11 @@ impl ListenComponent {
                             if !mapping.authenticated {
                                 return Ok(());
                             }
-                            let hb = auth.create_heartbeat(true);
+                            // Match UDPlex heartbeat flow:
+                            // forward HEARTBEAT -> listen HEARTBEAT -> forward HEARTBEAT_ACK.
+                            let hb = auth.create_heartbeat(false);
                             socket.send_to(&hb, addr).await?;
+                            mapping.last_heartbeat_sent = Some(Instant::now());
                             mapping.last_active = Instant::now();
                         }
                         return Ok(());
@@ -418,9 +388,6 @@ impl Component for ListenComponent {
 
         tokio::spawn(Arc::clone(&self).reader_loop(Arc::clone(&router), Arc::clone(&socket)));
         tokio::spawn(Arc::clone(&self).cleanup_loop());
-        if self.auth.is_some() {
-            tokio::spawn(Arc::clone(&self).heartbeat_loop());
-        }
 
         Ok(())
     }
