@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     let config = load_config(&cli.config)?;
 
     init_logger(&config);
+    install_panic_hook();
     info!("Prismux booting with config {}", cli.config.display());
 
     let router = Router::new(config.clone());
@@ -61,11 +62,16 @@ async fn main() -> Result<()> {
 
     info!("UDPlex started and ready");
 
-    tokio::signal::ctrl_c().await?;
+    let signal = wait_for_shutdown_signal().await?;
+    info!("Shutdown signal received: {signal}");
+
     if let Some(server) = api_server {
+        info!("Stopping API server");
         server.stop().await;
+        info!("API server stopped");
     }
     router.shutdown();
+    info!("Router shutdown notified, Prismux exiting");
     Ok(())
 }
 
@@ -83,6 +89,53 @@ fn init_logger(config: &Config) {
     } else {
         fmt().with_env_filter(filter).init();
     }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let message = if let Some(msg) = panic_info.payload().downcast_ref::<&str>() {
+            *msg
+        } else if let Some(msg) = panic_info.payload().downcast_ref::<String>() {
+            msg.as_str()
+        } else {
+            "non-string panic payload"
+        };
+
+        if let Some(location) = panic_info.location() {
+            error!(
+                file = location.file(),
+                line = location.line(),
+                column = location.column(),
+                "panic occurred: {message}"
+            );
+        } else {
+            error!("panic occurred: {message}");
+        }
+
+        default_hook(panic_info);
+    }));
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
+
+    tokio::select! {
+        _ = sigint.recv() => Ok("SIGINT"),
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<&'static str> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed waiting for Ctrl+C signal")?;
+    Ok("CTRL_C")
 }
 
 fn load_config(path: &Path) -> Result<Config> {
